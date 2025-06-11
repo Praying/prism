@@ -43,27 +43,27 @@ pub async fn run() -> Result<()> {
         )
         .arg(
             Arg::with_name("ip")
-                .short("i")
+                .short('i')
                 .long("ip")
                 .help("expose given ip for CLUSTER SLOTS/NODES command(may be used by jedis cluster connection).")
                 .takes_value(true),
         )
         .arg(
             Arg::with_name("metrics")
-                .short("m")
+                .short('m')
                 .long("metrics")
                 .help("port to expose prometheus (if compile without 'metrics' feature, this flag will be ignore).")
                 .takes_value(true),
         )
         .arg(
             Arg::with_name("version")
-                .short("V")
+                .short('V')
                 .long("version")
                 .help("show the version of prism."),
         )
         .arg(
             Arg::with_name("reload")
-                .short("r")
+                .short('r')
                 .long("reload")
                 .help("enable reload feature for standalone proxy mode."),
         )
