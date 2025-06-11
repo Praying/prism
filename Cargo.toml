@@ -50,7 +50,7 @@ aho-corasick = "1.0.1"
 rand = "0.8.5"
 clap = {version = "2.33.0", features = ["yaml"]}
 get_if_addrs = "0.5.3"
-prometheus =  "0.13.3"
+prometheus =  "0.14.0"
 actix-web =  "4.3.1"
 sysinfo =  "0.29.2"
 rayon = "1.7.0"
