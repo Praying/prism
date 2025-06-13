@@ -8,7 +8,6 @@ pub mod com;
 pub mod metrics;
 pub mod protocol;
 pub mod proxy;
-pub mod replication;
 pub mod utils;
 
 use crate::com::{AsError, CacheType, Config};
