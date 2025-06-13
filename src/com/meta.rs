@@ -10,8 +10,7 @@ use crate::com::ClusterConfig;
 const METRICS_ENABLED: &bool = &true;
 
 lazy_static! {
-    static ref CLUSTER_META: Mutex<HashMap<String, Arc<ClusterMeta>>> =
-        Mutex::new(HashMap::new());
+    static ref CLUSTER_META: Mutex<HashMap<String, Arc<ClusterMeta>>> = Mutex::new(HashMap::new());
 }
 
 pub fn meta_init(meta: ClusterMeta) {
@@ -46,7 +45,7 @@ fn get_local_ip() -> String {
         for iface in ifaces {
             for addr in iface.addr {
                 if !addr.ip().is_loopback() {
-                     if addr.ip().is_ipv4() {
+                    if addr.ip().is_ipv4() {
                         local_ip = addr.ip().to_string();
                         return local_ip;
                     }

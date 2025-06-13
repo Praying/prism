@@ -89,7 +89,6 @@ impl SingleFlightTrigger {
     }
 }
 
-
 pub struct Fetch {
     cluster: Arc<Cluster>,
 }
@@ -134,9 +133,7 @@ impl Fetch {
             }
             Err(err) => {
                 tracing::warn!("fail to parse cmd reply due to {}", err);
-                return Err(AsError::ProxyFail(
-                    "fail to parse cmd reply".to_string(),
-                ));
+                return Err(AsError::ProxyFail("fail to parse cmd reply".to_string()));
             }
         };
 

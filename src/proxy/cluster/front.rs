@@ -11,7 +11,10 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub async fn run(stream: TcpStream, cluster: Arc<Cluster>) -> Result<(), AsError> {
-    let peer_addr = stream.peer_addr().map(|addr| addr.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    let peer_addr = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     info!("[front:{}] new connection", peer_addr);
 
     let codec = <crate::protocol::redis::cmd::Cmd as Request>::FrontCodec::default();
@@ -29,7 +32,10 @@ pub async fn run(stream: TcpStream, cluster: Arc<Cluster>) -> Result<(), AsError
                         //info!("[front:{}] dispatch command failed because client connection may be closed", peer_addr);
                         break Ok(());
                     }
-                    error!("[front:{}] fail to dispatch cmd to cluster, error is {}", peer_addr, err);
+                    error!(
+                        "[front:{}] fail to dispatch cmd to cluster, error is {}",
+                        peer_addr, err
+                    );
                     break Err(err);
                 }
                 //info!("[front:{}] dispatch command returned, now waiting for reply", peer_addr);
@@ -38,18 +44,21 @@ pub async fn run(stream: TcpStream, cluster: Arc<Cluster>) -> Result<(), AsError
                     Ok(reply) => {
                         //info!("[front:{}] received reply from back task", peer_addr);
                         if let Err(err) = sink.send(reply).await {
-                            error!("[front:{}] fail to send reply to client, error is {}", peer_addr, err);
+                            error!(
+                                "[front:{}] fail to send reply to client, error is {}",
+                                peer_addr, err
+                            );
                             break Err(err);
                         }
                         //info!("[front:{}] sent reply to client successfully", peer_addr);
                     }
                     Err(err) => {
-                       info!(
+                        info!(
                            "[front:{}] fail to recv from oneshot, maybe connection closed, error is {}",
                            peer_addr, err
                        );
-                       break Ok(());
-                   }
+                        break Ok(());
+                    }
                 }
             }
             Some(Err(err)) => {

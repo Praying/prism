@@ -6,7 +6,6 @@ use std::string::FromUtf8Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::num::ParseIntError;
 
-
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -128,13 +127,13 @@ impl Config {
     }
 
     pub fn load(path: &str) -> Result<Self, AsError> {
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| AsError::ConfigFileFail(e.to_string()))?;
+        let mut f =
+            std::fs::File::open(path).map_err(|e| AsError::ConfigFileFail(e.to_string()))?;
         let mut data = String::new();
         std::io::Read::read_to_string(&mut f, &mut data)
             .map_err(|e| AsError::ConfigFileFail(e.to_string()))?;
-        let cfg: Config = toml::from_str(&data)
-            .map_err(|e| AsError::ConfigFileFail(e.to_string()))?;
+        let cfg: Config =
+            toml::from_str(&data).map_err(|e| AsError::ConfigFileFail(e.to_string()))?;
         Ok(cfg)
     }
 

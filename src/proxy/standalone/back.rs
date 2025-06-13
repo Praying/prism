@@ -8,12 +8,9 @@ use tracing::{error, info};
 pub async fn run_redis<
     Downstream: Stream<Item = crate::protocol::redis::cmd::Cmd> + Unpin,
     UpstreamSink: Sink<crate::protocol::redis::cmd::Cmd, Error = AsError> + Unpin,
-    UpstreamStream: Stream<Item = Result<crate::protocol::redis::resp::Message, AsError>>
-        + Unpin,
+    UpstreamStream: Stream<Item = Result<crate::protocol::redis::resp::Message, AsError>> + Unpin,
 >(
-    address: String,
-    mut downstream: Downstream,
-    mut upstream_sink: UpstreamSink,
+    address: String, mut downstream: Downstream, mut upstream_sink: UpstreamSink,
     mut upstream_stream: UpstreamStream,
 ) -> Result<(), AsError> {
     let pending_cmds = Arc::new(Mutex::new(VecDeque::new()));
@@ -76,9 +73,7 @@ pub async fn run_mc<
     UpstreamSink: Sink<crate::protocol::mc::Cmd, Error = AsError> + Unpin,
     UpstreamStream: Stream<Item = Result<crate::protocol::mc::Message, AsError>> + Unpin,
 >(
-    address: String,
-    mut downstream: Downstream,
-    mut upstream_sink: UpstreamSink,
+    address: String, mut downstream: Downstream, mut upstream_sink: UpstreamSink,
     mut upstream_stream: UpstreamStream,
 ) -> Result<(), AsError> {
     let pending_cmds = Arc::new(Mutex::new(VecDeque::new()));
@@ -143,9 +138,7 @@ pub struct Codec {}
 impl Encoder<crate::protocol::redis::cmd::Cmd> for Codec {
     type Error = AsError;
     fn encode(
-        &mut self,
-        item: crate::protocol::redis::cmd::Cmd,
-        dst: &mut BytesMut,
+        &mut self, item: crate::protocol::redis::cmd::Cmd, dst: &mut BytesMut,
     ) -> Result<(), Self::Error> {
         dst.extend_from_slice(&item.msg.data);
         Ok(())

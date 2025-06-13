@@ -17,9 +17,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(
-    cc: Arc<ClusterConfig>,
-    addr: String,
-    mut rx: mpsc::Receiver<Cmd>,
+    cc: Arc<ClusterConfig>, addr: String, mut rx: mpsc::Receiver<Cmd>,
 ) -> Result<(), AsError> {
     info!("[back:{}] task started, connecting", addr);
 
@@ -52,8 +50,9 @@ pub async fn run(
 
     if let Some(password) = cc.redis_auth.as_deref() {
         info!("[back:{}] authenticating", addr);
-        let mut cmd =
-            crate::protocol::redis::cmd::Cmd::new(crate::protocol::redis::resp::Message::auth(password));
+        let mut cmd = crate::protocol::redis::cmd::Cmd::new(
+            crate::protocol::redis::resp::Message::auth(password),
+        );
         let (tx, _rx) = tokio::sync::oneshot::channel();
         cmd.set_reply_sender(tx);
         let mut codec =
@@ -76,7 +75,8 @@ pub async fn run(
 
     let (mut sink, mut stream) = Framed::new(
         stream,
-        <crate::protocol::redis::cmd::Cmd as crate::proxy::standalone::Request>::BackCodec::default(),
+        <crate::protocol::redis::cmd::Cmd as crate::proxy::standalone::Request>::BackCodec::default(
+        ),
     )
     .split();
 

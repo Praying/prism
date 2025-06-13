@@ -168,7 +168,7 @@ pub struct Reloader<T: Request> {
 impl<T: Request + 'static> Reloader<T> {
     pub fn new(cluster: Rc<Cluster<T>>) -> Self {
         let enable = enable_reload();
-        let name = cluster.cc.lock().unwrap().name.clone();
+        let name = cluster.cc.name.clone();
         let weak = Rc::downgrade(&cluster);
         Reloader {
             name,
@@ -236,7 +236,7 @@ where
                 //     error!("fail to reload due to {:?}", err);
                 //     continue;
                 // }
-                info!("success reload for cluster {}", cluster.cc.lock().unwrap().name);
+                info!("success reload for cluster {}", self.name);
                 self.current = current;
             } else {
                 tracing::error!("fail to reload due to cluster has been destroyed");

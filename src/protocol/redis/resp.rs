@@ -332,7 +332,6 @@ impl From<AsError> for Message {
     }
 }
 
-
 impl Message {
     pub fn auth(password: &str) -> Message {
         let mut buf = BytesMut::new();
@@ -373,7 +372,7 @@ impl Message {
             rtype: RespType::Array(Range::new(0, 0), vec![]),
         }
     }
-pub fn is_error(&self) -> bool {
+    pub fn is_error(&self) -> bool {
         matches!(&self.rtype, RespType::Error(_))
     }
 
@@ -388,44 +387,44 @@ pub fn is_error(&self) -> bool {
             _ => 1,
         }
     }
-    
+
     pub fn mk_subs(&self) -> Vec<Message> {
         let cmd = match self.nth(0) {
             Some(c) => c,
             None => return vec![],
         };
-    
+
         if self.len() <= 1 {
             return vec![];
         }
-    
+
         let mut subs = Vec::with_capacity(self.len() - 1);
         for i in 1..self.len() {
             let key = match self.nth(i) {
                 Some(k) => k,
                 None => continue,
             };
-    
+
             let mut rdata = BytesMut::new();
             // *2\r\n
             rdata.put_slice(b"*2\r\n");
-    
+
             // $cmd_len\r\ncmd\r\n
             rdata.put_u8(RESP_BULK);
             rdata.put_slice(cmd.len().to_string().as_bytes());
             rdata.put_slice(b"\r\n");
             rdata.put_slice(cmd);
             rdata.put_slice(b"\r\n");
-    
+
             // $key_len\r\nkey\r\n
             rdata.put_u8(RESP_BULK);
             rdata.put_slice(key.len().to_string().as_bytes());
             rdata.put_slice(b"\r\n");
             rdata.put_slice(key);
             rdata.put_slice(b"\r\n");
-            
+
             if let Ok(Some(mut_msg)) = MessageMut::parse(&mut rdata) {
-                 subs.push(mut_msg.into());
+                subs.push(mut_msg.into());
             }
         }
         subs
@@ -732,7 +731,9 @@ pub fn parse_slot_ranges(msg: &Message) -> Result<Vec<SlotRange>, AsError> {
             let slave_port_rg = slave_array[1].to_range()?;
             let slave_ip = String::from_utf8(msg.data[slave_ip_rg.as_range()].to_vec())?;
             let slave_port = btoi::btoi::<u16>(&msg.data[slave_port_rg.as_range()])?;
-            slot_range.slaves.push(format!("{}:{}", slave_ip, slave_port));
+            slot_range
+                .slaves
+                .push(format!("{}:{}", slave_ip, slave_port));
         }
         ranges.push(slot_range);
     }
@@ -858,7 +859,7 @@ pub fn nodes_reply_to_layout(msg: &Message) -> Result<Option<Layout>, AsError> {
                 master_slaves.entry(id).or_insert_with(Vec::new);
             } else if flags.contains("slave") && master_id != "-" {
                 // Slaves are processed later, we just need their address for now.
-                 nodes.insert(
+                nodes.insert(
                     id,
                     NodeInfo {
                         addr: addr.clone(),
@@ -866,11 +867,11 @@ pub fn nodes_reply_to_layout(msg: &Message) -> Result<Option<Layout>, AsError> {
                         slots: vec![],
                     },
                 );
-                 if master_slaves.get_mut(master_id).is_some() {
+                if master_slaves.get_mut(master_id).is_some() {
                     master_slaves.get_mut(master_id).unwrap().push(addr);
-                 } else {
+                } else {
                     master_slaves.insert(master_id.to_string(), vec![addr]);
-                 }
+                }
             }
         }
 
@@ -886,7 +887,7 @@ pub fn nodes_reply_to_layout(msg: &Message) -> Result<Option<Layout>, AsError> {
                 });
             }
         }
-        
+
         slot_ranges.sort_by(|a, b| a.from.cmp(&b.from));
 
         if slot_ranges.is_empty() {
@@ -898,7 +899,6 @@ pub fn nodes_reply_to_layout(msg: &Message) -> Result<Option<Layout>, AsError> {
 
     Ok(None)
 }
-
 
 impl From<Layout> for ClusterLayout {
     fn from(layout: Layout) -> Self {

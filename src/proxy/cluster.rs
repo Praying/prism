@@ -37,8 +37,7 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn new(
-        cc: ClusterConfig,
-        trigger_tx: mpsc::Sender<fetcher::TriggerBy>,
+        cc: ClusterConfig, trigger_tx: mpsc::Sender<fetcher::TriggerBy>,
         cmd_tx: mpsc::Sender<ClusterCmd>,
     ) -> Self {
         let mut slots = Vec::with_capacity(16384);
@@ -106,26 +105,25 @@ impl Cluster {
             }
             retries += 1;
 
-            let (addr, ask) =
-                if let Some((addr, ask)) = redirection.take_redirect_addr() {
-                    (addr, ask)
-                } else {
-                    let cmd_for_hash = redirection.get_cmd();
-                    let key = crate::proxy::standalone::Request::key_hash(
-                        &cmd_for_hash, // use the clone
-                        self.cc
-                            .lock()
-                            .unwrap()
-                            .hash_tag
-                            .as_ref()
-                            .unwrap()
-                            .as_bytes(),
-                        crate::utils::crc::crc16,
-                    );
-                    let slot = key as usize & (16384 - 1);
-                    (self.slots.lock().unwrap()[slot].clone(), false)
-                };
-            
+            let (addr, ask) = if let Some((addr, ask)) = redirection.take_redirect_addr() {
+                (addr, ask)
+            } else {
+                let cmd_for_hash = redirection.get_cmd();
+                let key = crate::proxy::standalone::Request::key_hash(
+                    &cmd_for_hash, // use the clone
+                    self.cc
+                        .lock()
+                        .unwrap()
+                        .hash_tag
+                        .as_ref()
+                        .unwrap()
+                        .as_bytes(),
+                    crate::utils::crc::crc16,
+                );
+                let slot = key as usize & (16384 - 1);
+                (self.slots.lock().unwrap()[slot].clone(), false)
+            };
+
             let mut cmd_to_send = redirection.get_cmd();
 
             if ask {
@@ -139,9 +137,9 @@ impl Cluster {
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             cmd_to_send.set_reply_sender(tx);
-            
+
             if let Err(err) = self.dispatch_to(&addr, cmd_to_send).await {
-                 return redirection.return_err(err).await;
+                return redirection.return_err(err).await;
             }
 
             match rx.await {
@@ -149,15 +147,15 @@ impl Cluster {
                     if resp.is_error() {
                         let rstr = String::from_utf8_lossy(&resp.data);
                         if let Some(redirect) = Redirect::parse_from(&rstr) {
-                             self.trigger_fetch(fetcher::TriggerBy::Moved);
-                             redirection.set_redirect(redirect);
-                             continue;
+                            self.trigger_fetch(fetcher::TriggerBy::Moved);
+                            redirection.set_redirect(redirect);
+                            continue;
                         }
                     }
                     return redirection.return_ok(resp).await;
                 }
                 Err(_e) => {
-                     return redirection.return_err(AsError::Canceled).await;
+                    return redirection.return_err(AsError::Canceled).await;
                 }
             }
         }
@@ -172,7 +170,7 @@ impl Cluster {
         if let Some(mut tx) = sender {
             return tx.send(cmd).map_err(|_e| AsError::Canceled).await;
         }
-        
+
         warn!("connection to {} not found, maybe need to fetch", to);
         self.trigger_fetch(fetcher::TriggerBy::Connect(to.to_string()));
         Err(AsError::TryAgain)

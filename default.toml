@@ -3,8 +3,9 @@
     listen_addr = "0.0.0.0:6379"
     cache_type = "redis"
     listen_proto = "tcp"
+    thread = 1
     servers=[
-        "localhost:6379",
+        "127.0.0.1:6379",
     ]
     tcp_keepalive_secs = 0
     redis_ping_interval_secs = 0
@@ -44,8 +45,8 @@
     ]
     tcp_keepalive_secs = 0
     redis_ping_interval_secs = 0
-    redis_auth = "my-password"
-    thread = 1
+    redis_auth = ""
+    thread = 0
     fetch_interval = 3600000 
     read_from_slave = false
 

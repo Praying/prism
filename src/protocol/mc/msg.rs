@@ -70,12 +70,14 @@ lazy_static! {
     static ref TEXT_CMD_FINDER: AhoCorasick = {
         AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostFirst)
-            .build(TEXT_CMDS).expect("failed to build text command finder")
+            .build(TEXT_CMDS)
+            .expect("failed to build text command finder")
     };
     static ref TEXT_RESP_FINDER: AhoCorasick = {
         AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostFirst)
-            .build(TEXT_RESPS).expect("failed to build text response finder")
+            .build(TEXT_RESPS)
+            .expect("failed to build text response finder")
     };
 }
 
@@ -184,10 +186,10 @@ impl TextCmd {
 
     fn set_multi_key_range(&mut self, ranges: &mut Vec<Range>) {
         match self {
-            TextCmd::Get(  rgs)
-            | TextCmd::Gets( rgs)
-            | TextCmd::Gat(_,  rgs)
-            | TextCmd::Gats(_,  rgs) => {
+            TextCmd::Get(rgs)
+            | TextCmd::Gets(rgs)
+            | TextCmd::Gat(_, rgs)
+            | TextCmd::Gats(_, rgs) => {
                 std::mem::swap(rgs, ranges);
             }
             _ => unreachable!(),
@@ -196,7 +198,7 @@ impl TextCmd {
 
     fn set_expire_range(&mut self, begin: usize, end: usize) {
         match self {
-            TextCmd::Gat(  rg, _) | TextCmd::Gats(  rg, _) => {
+            TextCmd::Gat(rg, _) | TextCmd::Gats(rg, _) => {
                 rg.set_begin(begin);
                 rg.set_end(end);
             }
@@ -439,9 +441,7 @@ impl Message {
     }
 
     fn parse_text_req(
-        data: &mut BytesMut,
-        line: usize,
-        pat: usize,
+        data: &mut BytesMut, line: usize, pat: usize,
     ) -> Result<Option<Message>, AsError> {
         match pat {
             TEXT_PAT_SET => {
@@ -513,10 +513,7 @@ impl Message {
     }
 
     fn parse_text_get_and_touch(
-        data: &mut BytesMut,
-        mut cmd: TextCmd,
-        line: usize,
-        pat: usize,
+        data: &mut BytesMut, mut cmd: TextCmd, line: usize, pat: usize,
     ) -> Result<Option<Message>, AsError> {
         let mut iter = (&data[..line - 2]).split(|x| *x == BYTE_SPACE).skip(1); // skip cmd
         let mut cursor = TEXT_CMDS[pat].len() + 1;
@@ -542,10 +539,7 @@ impl Message {
     }
 
     fn parse_text_one_line(
-        data: &mut BytesMut,
-        mut cmd: TextCmd,
-        line: usize,
-        pat: usize,
+        data: &mut BytesMut, mut cmd: TextCmd, line: usize, pat: usize,
     ) -> Result<Option<Message>, AsError> {
         let mut iter = (&data[..line - 2]).split(|x| *x == BYTE_SPACE).skip(1);
         {
@@ -568,10 +562,7 @@ impl Message {
     }
 
     fn parse_text_retrieval(
-        data: &mut BytesMut,
-        mut cmd: TextCmd,
-        line: usize,
-        pat: usize,
+        data: &mut BytesMut, mut cmd: TextCmd, line: usize, pat: usize,
     ) -> Result<Option<Message>, AsError> {
         let iter = (&data[..line - 2]).split(|x| *x == BYTE_SPACE).skip(1); // skip cmd
         let mut cursor = TEXT_CMDS[pat].len() + 1;
@@ -593,10 +584,7 @@ impl Message {
     }
 
     fn parse_text_storage(
-        data: &mut BytesMut,
-        mut cmd: TextCmd,
-        line: usize,
-        pat: usize,
+        data: &mut BytesMut, mut cmd: TextCmd, line: usize, pat: usize,
     ) -> Result<Option<Message>, AsError> {
         let key_begin = TEXT_CMDS[pat].len() + 1;
         let mut iter = (&data[..line - BYTES_CRLF.len()]).split(|x| *x == BYTE_SPACE);
@@ -651,9 +639,7 @@ impl Message {
     }
 
     fn parse_text_value(
-        data: &mut BytesMut,
-        line: usize,
-        is_empty: bool,
+        data: &mut BytesMut, line: usize, is_empty: bool,
     ) -> Result<Option<Message>, AsError> {
         if is_empty {
             return Ok(Some(Message {
@@ -662,10 +648,7 @@ impl Message {
                 flags: CmdFlags::empty(),
             }));
         }
-        let len = if let Some(len_data) = (&data[..line - 2])
-            .split(|x| *x == BYTE_SPACE)
-            .nth(3)
-        {
+        let len = if let Some(len_data) = (&data[..line - 2]).split(|x| *x == BYTE_SPACE).nth(3) {
             match btoi::btoi::<usize>(len_data) {
                 Ok(len) => len,
                 Err(_err) => {
@@ -1066,8 +1049,8 @@ impl Message {
 
     pub fn save_req(&self, target: &mut BytesMut) -> Result<(), AsError> {
         match &self.mtype {
-            MsgType::TextReq( ttype) => match ttype {
-                TextCmd::Get( ranges) | TextCmd::Gets( ranges) => {
+            MsgType::TextReq(ttype) => match ttype {
+                TextCmd::Get(ranges) | TextCmd::Gets(ranges) => {
                     target.extend_from_slice(ttype.cmd_slice());
                     for rng in &ranges[..] {
                         target.extend_from_slice(BYTES_SPACE);
@@ -1076,7 +1059,7 @@ impl Message {
                     target.extend_from_slice(BYTES_CRLF);
                     Ok(())
                 }
-                TextCmd::Gat(expire,  ranges) | TextCmd::Gats( expire,  ranges) => {
+                TextCmd::Gat(expire, ranges) | TextCmd::Gats(expire, ranges) => {
                     target.extend_from_slice(ttype.cmd_slice());
                     target.extend_from_slice(BYTES_SPACE);
                     target.extend_from_slice(&self.data[expire.begin()..expire.end()]);
