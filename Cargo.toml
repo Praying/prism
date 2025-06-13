@@ -65,7 +65,7 @@ metrics = ["prometheus", "sysinfo"]
 
 [dev-dependencies]
 # pretty_assertions = "0.6"
-criterion = "0.4"
+criterion = "0.6"
 # jemallocator = { version = "0.3", features = ["profiling", "stats"] }
 # pprof = { version = "0.3", features = ["flamegraph"] }
 
