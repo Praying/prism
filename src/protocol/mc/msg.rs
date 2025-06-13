@@ -389,6 +389,10 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
+
     pub fn parse(data: &mut BytesMut) -> Result<Option<Message>, AsError> {
         if data.is_empty() {
             return Ok(None);
@@ -520,7 +524,7 @@ impl Message {
             cmd.set_expire_range(cursor, cursor + expire.len());
             cursor += expire.len() + 1;
         } else {
-            data.split_to(line);
+            let _ = data.split_to(line);
             return Err(AsError::BadMessage);
         }
 

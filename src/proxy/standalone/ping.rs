@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::protocol::IntoReply;
 use crate::proxy::standalone::{Cluster, Request};
 use tracing::{debug, info};
 
@@ -32,7 +33,10 @@ pub struct Ping<T: Request> {
     cancel: Arc<AtomicBool>,
 }
 
-impl<T: Request + Send + 'static> Ping<T> {
+impl<T: Request + Send + 'static + From<crate::protocol::redis::cmd::Cmd>> Ping<T>
+where
+    T::Reply: IntoReply<crate::protocol::redis::resp::Message>,
+{
     pub fn new(
         cluster: Weak<Cluster<T>>,
         name: String,
@@ -81,12 +85,10 @@ impl<T: Request + Send + 'static> Ping<T> {
                         if self.count > self.limit {
                             // removed but success next time
                             let cluster = self.cluster.upgrade();
-                            if let Some(cluster) = cluster {
-                                let name = self.name.clone();
+                            if let Some(_cluster) = cluster {
+                                let _name = self.name.clone();
                                 tokio::spawn(async move {
-                                    if let Err(err) = cluster.add_node(name.clone()).await {
-                                        tracing::error!("fail to add node for {} due to {:?}", name, err);
-                                    }
+                                    // TODO: add node by reload
                                 });
                             } else {
                                 return;
@@ -100,9 +102,9 @@ impl<T: Request + Send + 'static> Ping<T> {
 
                         #[allow(clippy::comparison_chain)]
                         if self.count == self.limit {
-                            if let Some(cluster) = self.cluster.upgrade() {
+                            if let Some(_cluster) = self.cluster.upgrade() {
                                 info!("remove node={} addr={} by ping error", self.name, self.addr);
-                                cluster.remove_node(self.name.clone());
+                                // TODO: remove node by reload
                             } else {
                                 return;
                             }
@@ -114,10 +116,10 @@ impl<T: Request + Send + 'static> Ping<T> {
                         }
 
                         let cluster = self.cluster.upgrade();
-                        if let Some(cluster) = cluster {
-                            let addr = self.addr.clone();
+                        if let Some(_cluster) = cluster {
+                            let _addr = self.addr.clone();
                             tokio::spawn(async move {
-                                cluster.reconnect(&addr).await;
+                                // TODO: reconnect by reload
                             });
                         } else {
                             return;

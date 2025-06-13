@@ -1,73 +1,62 @@
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Notify {
-    shared: NotifyShared,
+    shared: Arc<NotifyShared>,
 }
 
 impl Notify {
-    pub fn empty() -> Self {
+    pub fn new() -> Self {
         Notify {
-            shared: NotifyShared {
-                task: Rc::new(RefCell::new(None)),
-                count: Rc::new(Cell::new(1u16)),
-                expect: std::u16::MAX,
-            },
+            shared: Arc::new(NotifyShared {
+                waker: Mutex::new(None),
+                count: AtomicU16::new(1),
+                expect: AtomicU16::new(std::u16::MAX),
+            }),
         }
     }
 
-    pub fn set_waker(&mut self, waker: &Waker) {
-        self.shared.task.borrow_mut().replace(waker.clone());
+    pub fn register(&self, waker: &Waker) {
+        let mut w = self.shared.waker.lock().unwrap();
+        if w.as_ref().map_or(true, |w2| !w2.will_wake(waker)) {
+            *w = Some(waker.clone());
+        }
     }
 
     pub fn notify(&self) {
-        if let Some(waker) = self.shared.task.borrow().as_ref() {
-            // trace!("trace notify Some");
+        if let Some(waker) = self.shared.waker.lock().unwrap().as_ref() {
             waker.wake_by_ref();
-        } else {
-            // trace!("trace notify None");
         }
     }
 
-    pub fn set_expect(&mut self, expect: u16) {
-        self.shared.expect = expect;
+    pub fn set_expect(&self, expect: u16) {
+        self.shared.expect.store(expect, Ordering::SeqCst);
     }
 
     pub fn expect(&self) -> u16 {
-        self.shared.expect
+        self.shared.expect.load(Ordering::SeqCst)
     }
 
     pub fn fetch_sub(&self, val: u16) -> u16 {
-        let origin_val = self.shared.count.get();
-        self.shared.count.set(origin_val - val);
-        origin_val
+        self.shared.count.fetch_sub(val, Ordering::SeqCst)
     }
 
     pub fn fetch_add(&self, val: u16) -> u16 {
-        let origin_val = self.shared.count.get();
-        self.shared.count.set(origin_val - val);
-        origin_val
+        self.shared.count.fetch_add(val, Ordering::SeqCst)
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[derive(Debug)]
 struct NotifyShared {
-    task: Rc<RefCell<Option<Waker>>>,
-    count: Rc<Cell<u16>>,
-    expect: u16,
-}
-
-impl Clone for NotifyShared {
-    fn clone(&self) -> NotifyShared {
-        let count = self.count.clone();
-        let now_val = count.get();
-        count.set(now_val + 1);
-        NotifyShared {
-            count,
-            task: self.task.clone(),
-            expect: self.expect,
-        }
-    }
+    waker: Mutex<Option<Waker>>,
+    count: AtomicU16,
+    expect: AtomicU16,
 }

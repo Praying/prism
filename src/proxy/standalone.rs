@@ -5,40 +5,42 @@ pub mod ketama;
 pub mod ping;
 pub mod reload;
 
-use futures::StreamExt;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc::Sender;
-use tokio_util::codec::{Decoder, Encoder};
-
-use std::task::Waker;
-use tracing::{debug, info};
-use std::collections::{HashMap, HashSet};
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-use crate::protocol::{mc, redis};
-
-use crate::metrics::front_conn_incr;
-
 use crate::com::AsError;
 use crate::com::{CacheType, ClusterConfig};
-use crate::protocol::IntoReply;
-
+use crate::metrics::front_conn_incr;
+use crate::protocol::redis::resp::Message;
+use crate::protocol::{mc, redis, IntoReply};
+use anyhow::Result;
+use bytes::BytesMut;
+use futures::{future, prelude::*, StreamExt};
 use ketama::HashRing;
+use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Waker;
+use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::Sender;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::codec::{Decoder, Encoder};
+use tracing::{error, info};
 
-pub trait Request: Clone + Send + Sync {
-    type Reply: Clone + IntoReply<Self::Reply> + From<AsError>;
+pub trait Request: Clone + Send + Sync + 'static {
+    type Reply: Clone + IntoReply<Self::Reply> + From<AsError> + Send;
     type ReplySender: Send;
 
     type FrontCodec: Decoder<Item = Self, Error = AsError>
-        + Encoder<Self, Error = AsError>
+        + Encoder<Self::Reply, Error = AsError>
         + Default
+        + Send
         + 'static;
     type BackCodec: Decoder<Item = Self::Reply, Error = AsError>
         + Encoder<Self, Error = AsError>
         + Default
+        + Send
         + 'static;
 
     fn ping_request() -> Self;
@@ -61,14 +63,14 @@ pub trait Request: Clone + Send + Sync {
 
     fn valid(&self) -> bool;
 
-    fn set_reply<R: IntoReply<Self::Reply>>(&self, t: R);
-    fn set_error(&self, t: &AsError);
-    fn set_reply_sender(&self, sender: Self::ReplySender);
+    fn set_reply(&mut self, t: Self::Reply);
+    fn set_error(&mut self, t: AsError);
+    fn set_reply_sender(&mut self, sender: Self::ReplySender);
 
     fn get_sendtime(&self) -> Option<Instant>;
 }
 
-pub struct Cluster<T> {
+pub struct Cluster<T: Request> {
     pub cc: Mutex<ClusterConfig>,
     hash_tag: Vec<u8>,
     spots: Mutex<HashMap<String, usize>>,
@@ -80,8 +82,7 @@ pub struct Cluster<T> {
     pings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
-impl<T: Request + Send + Sync + 'static> Cluster<T> {
-
+impl<T: Request + Send + Sync + Unpin + 'static> Cluster<T> {
     fn ping_fail_limit(&self) -> u8 {
         self.cc
             .lock()
@@ -111,196 +112,79 @@ impl<T: Request + Send + Sync + 'static> Cluster<T> {
             .cloned()
             .unwrap_or(1_000)
     }
-
-    fn setup_ping(
-        self: &Arc<Self>,
-        alias: &str,
-        node: &str,
-        ping_interval: u64,
-        ping_succ_interval: u64,
-        ping_fail_limit: u8,
-    ) {
-        const CANCEL: bool = false;
-        let handle = Arc::new(AtomicBool::new(CANCEL));
-        {
-            let mut pings = self.pings.lock().unwrap();
-            pings.insert(node.to_string(), handle.clone());
-        }
-
-        let ping = ping::Ping::new(
-            Arc::downgrade(self),
-            alias.to_string(),
-            node.to_string(),
-            handle,
-            ping_interval,
-            ping_succ_interval,
-            ping_fail_limit,
-        );
-        tokio::spawn(ping.run());
-    }
-
-    pub(crate) async fn reinit(self: &Arc<Self>, cc: ClusterConfig) -> Result<(), AsError> {
-        let sls = ServerLine::parse_servers(&cc.servers)?;
-        let (nodes, alias, weights) = ServerLine::unwrap_spot(&sls);
-        let alias_map: HashMap<_, _> = alias
-            .clone()
-            .into_iter()
-            .zip(nodes.clone().into_iter())
-            .collect();
-        let alias_rev: HashMap<_, _> = alias_map
-            .iter()
-            .map(|(x, y)| (y.clone(), x.clone()))
-            .collect();
-        let spots_map: HashMap<_, _> = if alias.is_empty() {
-            nodes
-                .clone()
-                .into_iter()
-                .zip(weights.clone().into_iter())
-                .collect()
-        } else {
-            alias
-                .clone()
-                .into_iter()
-                .zip(weights.clone().into_iter())
-                .collect()
-        };
-        let hash_ring = if alias.is_empty() {
-            HashRing::new(nodes, weights)?
-        } else {
-            HashRing::new(alias, weights)?
-        };
-        let addrs: HashSet<_> = if !alias_map.is_empty() {
-            alias_map.values().map(|x| x.to_string()).collect()
-        } else {
-            spots_map.keys().map(|x| x.to_string()).collect()
-        };
-        let old_addrs = self.conns.lock().unwrap().addrs();
-
-        let new_addrs = addrs.difference(&old_addrs);
-        let unused_addrs = old_addrs.difference(&addrs);
-        for addr in new_addrs {
-            self.reconnect(&*addr).await;
-            let ping_fail_limit = self.ping_fail_limit();
-            if ping_fail_limit > 0 {
-                let ping_interval = self.ping_interval();
-                let ping_succ_interval = self.ping_succ_interval();
-                let alias = alias_rev
-                    .get(addr)
-                    .expect("alias must be exists")
-                    .to_string();
-                self.setup_ping(
-                    &alias,
-                    addr,
-                    ping_interval,
-                    ping_succ_interval,
-                    ping_fail_limit,
-                );
-            }
-        }
-
-        for addr in unused_addrs {
-            self.conns.lock().unwrap().remove(&addr);
-            let mut pings = self.pings.lock().unwrap();
-            if let Some(handle) = pings.remove(addr) {
-                handle.store(true, Ordering::SeqCst);
-            }
-        }
-
-        *self.cc.lock().unwrap() = cc;
-        *self.ring.lock().unwrap() = hash_ring;
-        *self.alias.lock().unwrap() = alias_map;
-        *self.spots.lock().unwrap() = spots_map;
-        Ok(())
-    }
-
-    fn has_alias(&self) -> bool {
-        !self.alias.lock().unwrap().is_empty()
-    }
-
-    fn get_node(&self, name: String) -> String {
-        if !self.has_alias() {
-            return name;
-        }
-
-        self.alias
-            .lock()
-            .unwrap()
-            .get(&name)
-            .expect("alias name must exists")
-            .to_string()
-    }
-
-    pub(crate) async fn add_node(&self, name: String) -> Result<(), AsError> {
-        let weight = self.spots.lock().unwrap().get(&name).cloned();
-        if let Some(weight) = weight {
-            let addr = self.get_node(name.clone());
-            let (cluster_name, read_timeout, write_timeout) = {
-                let cc = self.cc.lock().unwrap();
-                (cc.name.clone(), cc.read_timeout, cc.write_timeout)
-            };
-            let conn = connect(&cluster_name, &addr, read_timeout, write_timeout).await?;
-            self.conns.lock().unwrap().insert(&addr, conn);
-            self.ring.lock().unwrap().add_node(name, weight);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn remove_node(&self, name: String) {
-        self.ring.lock().unwrap().del_node(&name);
-        let node = self.get_node(name);
-        if self.conns.lock().unwrap().remove(&node).is_some() {
-            info!("dropping backend connection of {} due active delete", node);
-        }
-    }
-
-    pub(crate) async fn reconnect(&self, addr: &str) {
-        self.conns.lock().unwrap().remove(addr);
-        debug!("trying to reconnect to {}", addr);
-        let (cluster_name, read_timeout, write_timeout) = {
-            let cc = self.cc.lock().unwrap();
-            (cc.name.clone(), cc.read_timeout, cc.write_timeout)
-        };
-        match connect(&cluster_name, &addr, read_timeout, write_timeout).await {
-            Ok(sender) => self.conns.lock().unwrap().insert(&addr, sender),
-            Err(err) => {
-                tracing::error!("fail to reconnect to {} due to {:?}", addr, err);
-            }
-        }
-    }
-
 }
 
-pub async fn connect<T>(
-    cluster: &str,
+pub async fn connect_redis(
+    cc: &ClusterConfig,
     node: &str,
-    rt: Option<u64>,
-    _wt: Option<u64>,
-) -> Result<tokio::sync::mpsc::Sender<T>, AsError>
-where
-    T: Request + 'static,
-{
+) -> Result<tokio::sync::mpsc::Sender<redis::cmd::Cmd>, AsError> {
+    let addr = node.parse::<SocketAddr>()?;
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+
+    if let Some(password) = &cc.redis_auth {
+        let auth_msg = redis::resp::Message::auth(password);
+        stream.write_all(&auth_msg.data).await?;
+
+        let mut buf = BytesMut::with_capacity(256);
+        let n = stream.read_buf(&mut buf).await?;
+        if n == 0 {
+            return Err(AsError::BackendClosedError(
+                "redis auth failed with empty reply".to_string(),
+            ));
+        }
+
+        let msg = match redis::resp::Message::parse(&mut buf)? {
+            Some(msg) => msg,
+            None => {
+                return Err(AsError::BackendClosedError(
+                    "redis auth failed with incomplete reply".to_string(),
+                ));
+            }
+        };
+        if msg.is_error() {
+            return Err(AsError::BadAuth);
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1024 * 8);
+    let rx = ReceiverStream::new(rx);
+
+    let codec = <redis::cmd::Cmd as Request>::BackCodec::default();
+    let (sink, stream) = codec.framed(stream).split();
+
+    let fut = back::run_redis(node.to_string(), rx, sink, stream);
+    tokio::spawn(fut);
+
+    Ok(tx)
+}
+
+pub async fn connect_mc(
+    _cc: &ClusterConfig,
+    node: &str,
+) -> Result<tokio::sync::mpsc::Sender<mc::Cmd>, AsError> {
     let addr = node.parse::<SocketAddr>()?;
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(1024 * 8);
-    
-    let codec = T::BackCodec::default();
+    let rx = ReceiverStream::new(rx);
+
+    let codec = <mc::Cmd as Request>::BackCodec::default();
     let (sink, stream) = codec.framed(stream).split();
-    
-    // TODO: make back::Back async
-    // let backend = back::Back::new(cluster.to_string(), node.to_string(), rx, sink, stream, rt.unwrap_or(1000));
-    // tokio::spawn(backend);
+
+    let fut = back::run_mc(node.to_string(), rx, sink, stream);
+    tokio::spawn(fut);
 
     Ok(tx)
 }
 
-struct Conns<T> {
+struct Conns<T: Request> {
     _marker: PhantomData<T>,
     inner: HashMap<String, Conn<tokio::sync::mpsc::Sender<T>>>,
 }
 
-impl<T> Conns<T> {
+impl<T: Request> Conns<T> {
     fn addrs(&self) -> HashSet<String> {
         self.inner.keys().cloned().collect()
     }
@@ -322,7 +206,7 @@ impl<T> Conns<T> {
     }
 }
 
-impl<T> Default for Conns<T> {
+impl<T: Request> Default for Conns<T> {
     fn default() -> Conns<T> {
         Conns {
             inner: HashMap::new(),
@@ -363,6 +247,7 @@ impl ServerLine {
                     weight: 1,
                     alias,
                 });
+                continue;
             }
 
             let mut fp_sp = first_part.rsplitn(2, ':').filter(|x| !x.is_empty());
@@ -402,19 +287,18 @@ impl ServerLine {
     }
 }
 
-use std::net::SocketAddr;
-use anyhow::Result;
-
 pub async fn run(cc: ClusterConfig) -> Result<()> {
     info!("standalone cluster {} running", cc.name);
     match cc.cache_type {
-        CacheType::Redis => run_inner::<redis::Cmd>(cc).await,
-        CacheType::Memcache | CacheType::MemcacheBinary => run_inner::<mc::Cmd>(cc).await,
+        CacheType::Redis => run_inner_redis(cc).await,
+        CacheType::Memcache | CacheType::MemcacheBinary => run_inner_mc(cc).await,
         _ => unreachable!(),
     }
 }
 
-async fn run_inner<T: Request + 'static>(cc: ClusterConfig) -> Result<()> {
+async fn run_inner_redis(cc: ClusterConfig) -> Result<()> {
+    type T = crate::protocol::redis::cmd::Cmd;
+
     let hash_tag = cc
         .hash_tag
         .as_ref()
@@ -432,8 +316,7 @@ async fn run_inner<T: Request + 'static>(cc: ClusterConfig) -> Result<()> {
         pings: Mutex::new(HashMap::new()),
     });
 
-    cluster.reinit(cc.clone()).await?;
-
+    reinit_redis(&cluster, cc.clone()).await?;
 
     let ping_fail_limit = cluster.ping_fail_limit();
     if ping_fail_limit > 0 {
@@ -441,7 +324,8 @@ async fn run_inner<T: Request + 'static>(cc: ClusterConfig) -> Result<()> {
         let ping_succ_interval = cluster.ping_succ_interval();
         let alias_map = cluster.alias.lock().unwrap().clone();
         for (alias, node) in alias_map.into_iter() {
-            cluster.setup_ping(
+            setup_ping_redis(
+                &cluster,
                 &alias,
                 &node,
                 ping_interval,
@@ -450,44 +334,260 @@ async fn run_inner<T: Request + 'static>(cc: ClusterConfig) -> Result<()> {
             );
         }
     }
-    // let reloader = reload::Reloader::new(cluster.clone());
-    // tokio::spawn(reloader);
 
-
-    let addr = cc
-        .listen_addr
-        .parse::<SocketAddr>()?;
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("standalone cluster {} listening on {}", cc.name, addr);
+    let listen_addr = cc.listen_addr;
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!("standalone cluster listening on {}", listen_addr);
 
     loop {
-        let (sock, client_addr) = listener.accept().await?;
+        let (socket, addr) = listener.accept().await?;
+        info!("accept a new connection from {}", addr);
         let cluster_clone = cluster.clone();
         tokio::spawn(async move {
-            info!("accept new connection from {}", client_addr);
-            if let Err(e) = handle_connection(cluster_clone, sock).await {
-                tracing::error!("handle connection from {} failed: {}", client_addr, e);
+            if let Err(err) = handle_connection_redis(cluster_clone, socket).await {
+                error!(
+                    "fail to handle connection for {} due to {:?}",
+                    addr, err
+                );
             }
         });
     }
 }
 
-async fn handle_connection<T: Request + 'static>(cluster: Arc<Cluster<T>>, sock: TcpStream) -> Result<()> {
-    if let Err(err) = sock.set_nodelay(true) {
-        tracing::warn!(
-            "cluster {} fail to set nodelay but skip, due to {:?}",
-            cluster.cc.lock().unwrap().name,
-            err
-        );
+async fn handle_connection_redis(
+    cluster: Arc<Cluster<redis::cmd::Cmd>>,
+    socket: TcpStream,
+) -> Result<(), AsError> {
+    front_conn_incr();
+    let codec = <redis::cmd::Cmd as Request>::FrontCodec::default();
+    let (mut sink, mut stream) = codec.framed(socket).split();
+
+    while let Some(Ok(mut req)) = stream.next().await {
+        let req_start_time = Instant::now();
+        req.mark_total(&cluster.cc.lock().unwrap().name);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        req.set_reply_sender(reply_tx);
+
+        if let Some(subs) = req.subs() {
+            let cluster_clone = cluster.clone();
+            let fut = proxy_route_redis_multi(cluster_clone, req, subs);
+            tokio::spawn(fut);
+        } else {
+            let cluster_clone = cluster.clone();
+            let fut = proxy_route_redis(cluster_clone, req);
+            tokio::spawn(fut);
+        }
+
+        match reply_rx.await {
+            Ok(resp) => {
+                if let Err(err) = sink.send(resp).await {
+                    error!("front sink send failed {:?}", err);
+                    return Err(err.into());
+                }
+                info!("request total spend time: {:?}", req_start_time.elapsed());
+            }
+            Err(err) => {
+                error!("fail to receive from proxy_route thread {:?}", err);
+                return Err(AsError::BackendFail("channel closed".to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn proxy_route_redis(
+    cluster: Arc<Cluster<redis::cmd::Cmd>>,
+    mut req: redis::cmd::Cmd,
+) {
+    let route_start_time = Instant::now();
+    let hash_tag = &cluster.hash_tag;
+    let key_hash = req.key_hash(hash_tag, fnv::fnv1a64);
+
+    let backend_addr = {
+        let ring = cluster.ring.lock().unwrap();
+        ring.get_node(key_hash).map(|s| s.to_string())
+    };
+
+    let backend_addr = match backend_addr {
+        Some(addr) => addr,
+        None => {
+            req.set_error(AsError::BackendFail(format!(
+                "backend not found for key {:?}",
+                req.msg.get_key()
+            )));
+            return;
+        }
+    };
+
+    let sender = cluster
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&backend_addr)
+        .map(|conn| conn.sender().clone());
+
+    if let Some(sender) = sender {
+        if let Err(err) = sender.send(req).await {
+            let mut req = err.0;
+            error!(
+                "fail to send request to backend {} due to send error",
+                backend_addr
+            );
+            req.set_error(AsError::BackendFail(
+                "backend chan is closed".to_string(),
+            ));
+        }
+    } else {
+        req.set_error(AsError::BackendFail(format!(
+            "backend connection not found for key {:?}",
+            req.msg.get_key()
+        )));
+    }
+    info!("proxy route spend time: {:?}", route_start_time.elapsed());
+}
+#[inline(never)]
+async fn proxy_route_redis_multi(
+    cluster: Arc<Cluster<redis::cmd::Cmd>>,
+    mut req: redis::cmd::Cmd,
+    subs: Vec<redis::cmd::Cmd>,
+) {
+    // handle mget/mset commands
+    let mut futs = Vec::new();
+
+    for mut sub_req in subs {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sub_req.set_reply_sender(tx);
+        let cluster_clone = cluster.clone();
+        let fut = async move {
+            proxy_route_redis(cluster_clone, sub_req).await;
+            rx.await
+        };
+        futs.push(fut);
     }
 
-    let codec = T::FrontCodec::default();
-    let (output, input) = codec.framed(sock).split();
+    let mut replies = Vec::new();
+    let results = future::join_all(futs).await;
+    for result in results {
+        match result {
+            Ok(resp) => replies.push(resp),
+            Err(e) => {
+                error!("fail to join all due to {:?}", e);
+                let resp = Message::from(AsError::BackendFail(e.to_string()));
+                replies.push(resp);
+            }
+        }
+    }
+    let merged = Message::from_msgs(replies);
+    req.set_reply(merged);
+}
 
-    front_conn_incr(&cluster.cc.lock().unwrap().name);
-    // TODO: make front::Front async
-    // let fut = front::Front::new(cluster, input, output);
-    // fut.await?;
+// a lot of function needs to be specialized for redis and mc
+// I will do it step by step
+async fn reinit_redis(
+    cluster: &Arc<Cluster<redis::cmd::Cmd>>,
+    cc: ClusterConfig,
+) -> Result<(), AsError> {
+    let sls = ServerLine::parse_servers(&cc.servers)?;
+    let (nodes, alias, weights) = ServerLine::unwrap_spot(&sls);
+    let alias_map: HashMap<_, _> = alias
+        .clone()
+        .into_iter()
+        .zip(nodes.clone().into_iter())
+        .collect();
+    let alias_rev: HashMap<_, _> = alias_map
+        .iter()
+        .map(|(x, y)| (y.clone(), x.clone()))
+        .collect();
+    let spots_map: HashMap<_, _> = if alias.is_empty() {
+        nodes
+            .clone()
+            .into_iter()
+            .zip(weights.clone().into_iter())
+            .collect()
+    } else {
+        alias
+            .clone()
+            .into_iter()
+            .zip(weights.clone().into_iter())
+            .collect()
+    };
+    let hash_ring = if alias.is_empty() {
+        HashRing::new(nodes, weights)?
+    } else {
+        HashRing::new(alias, weights)?
+    };
+    let addrs: HashSet<_> = if !alias_map.is_empty() {
+        alias_map.values().map(|x| x.to_string()).collect()
+    } else {
+        spots_map.keys().map(|x| x.to_string()).collect()
+    };
+    let old_addrs = cluster.conns.lock().unwrap().addrs();
+
+    let new_addrs = addrs.difference(&old_addrs);
+    let unused_addrs = old_addrs.difference(&addrs);
+    for addr in new_addrs {
+        let sender = connect_redis(&cc, &*addr).await?;
+        cluster.conns.lock().unwrap().insert(&*addr, sender);
+        let ping_fail_limit = cluster.ping_fail_limit();
+        if ping_fail_limit > 0 {
+            let ping_interval = cluster.ping_interval();
+            let ping_succ_interval = cluster.ping_succ_interval();
+            let alias = alias_rev
+                .get(addr)
+                .expect("alias must exists")
+                .to_string();
+            setup_ping_redis(
+                &cluster,
+                &alias,
+                addr,
+                ping_interval,
+                ping_succ_interval,
+                ping_fail_limit,
+            );
+        }
+    }
+
+    for addr in unused_addrs {
+        cluster.conns.lock().unwrap().remove(addr);
+        let alias = alias_rev
+            .get(addr)
+            .expect("alias must exists")
+            .to_string();
+        if let Some(ping) = cluster.pings.lock().unwrap().get(&alias) {
+            ping.store(false, Ordering::SeqCst);
+        }
+    }
+
+    let mut ring = cluster.ring.lock().unwrap();
+    *ring = hash_ring;
+    let mut spots = cluster.spots.lock().unwrap();
+    *spots = spots_map;
+    let mut alias = cluster.alias.lock().unwrap();
+    *alias = alias_map;
+
     Ok(())
+}
+
+fn setup_ping_redis(
+    cluster: &Arc<Cluster<redis::cmd::Cmd>>,
+    alias: &str,
+    node: &str,
+    ping_interval: u64,
+    ping_succ_interval: u64,
+    ping_fail_limit: u8,
+) {
+    let ping = ping::Ping::new(
+        Arc::downgrade(cluster),
+        alias.to_string(),
+        node.to_string(),
+        Arc::new(AtomicBool::new(true)),
+        ping_interval,
+        ping_succ_interval,
+        ping_fail_limit,
+    );
+    tokio::spawn(ping.run());
+}
+
+async fn run_inner_mc(_cc: ClusterConfig) -> Result<()> {
+    unimplemented!()
 }

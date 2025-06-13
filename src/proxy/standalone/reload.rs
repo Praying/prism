@@ -157,7 +157,7 @@ impl Version {
     }
 }
 
-pub struct Reloader<T> {
+pub struct Reloader<T: Request> {
     name: String,
     cluster: Weak<Cluster<T>>,
     current: Version,
@@ -183,7 +183,7 @@ impl<T: Request + 'static> Reloader<T> {
     }
 }
 
-impl<T> Future for Reloader<T>
+impl<T: Request> Future for Reloader<T>
 where
     T: Request + Unpin + 'static,
 {
@@ -223,7 +223,7 @@ where
                 }
             };
 
-            let cc = match config.cluster(&self.name) {
+            let _cc = match config.get_cluster(&self.name) {
                 Some(cc) => cc,
                 None => {
                     debug!("fail to reload, config absents cluster {}", self.name);

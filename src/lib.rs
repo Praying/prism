@@ -1,12 +1,4 @@
 // #![deny(warnings)]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
-
-extern crate clap;
-
-#[macro_use]
-extern crate prometheus;
 
 pub mod metrics;
 
@@ -43,35 +35,35 @@ pub async fn run() -> Result<()> {
         )
         .arg(
             Arg::with_name("ip")
-                .short('i')
+                .short("i")
                 .long("ip")
                 .help("expose given ip for CLUSTER SLOTS/NODES command(may be used by jedis cluster connection).")
                 .takes_value(true),
         )
         .arg(
             Arg::with_name("metrics")
-                .short('m')
+                .short("m")
                 .long("metrics")
                 .help("port to expose prometheus (if compile without 'metrics' feature, this flag will be ignore).")
                 .takes_value(true),
         )
         .arg(
             Arg::with_name("version")
-                .short('V')
+                .short("V")
                 .long("version")
                 .help("show the version of prism."),
         )
         .arg(
             Arg::with_name("reload")
-                .short('r')
+                .short("r")
                 .long("reload")
                 .help("enable reload feature for standalone proxy mode."),
         )
         .get_matches();
     let config = matches.value_of("config").unwrap_or("default.toml");
-    let watch_file = config.to_string();
+    let _watch_file = config.to_string();
     let ip = matches.value_of("ip").map(|x| x.to_string());
-    let enable_reload = matches.is_present("reload");
+    let _enable_reload = matches.is_present("reload");
     info!("[prism-{}] loading config from {}", PRISM_VERSION, config);
     let cfg = com::Config::load(&config)?;
     debug!("use config : {:?}", cfg);
@@ -111,7 +103,7 @@ pub async fn run() -> Result<()> {
     }
 
     let port_str = matches.value_of("metrics").unwrap_or("2110");
-    let port = port_str.parse::<usize>().unwrap_or(2110);
+    let _port = port_str.parse::<usize>().unwrap_or(2110);
     let metrics_handle = tokio::spawn(async move {
         // TODO: make metrics::init async
         // metrics::init(port).await
@@ -144,12 +136,12 @@ fn spawn_cluster(cc: ClusterConfig, ip: Option<String>) -> JoinHandle<()> {
         let name = cc.name.clone();
         match &cc.cache_type {
             com::CacheType::RedisCluster => {
-                if let Err(e) = proxy::cluster::run(cc).await {
+                if let Err(e) = proxy::cluster::run(cc.clone()).await {
                     tracing::error!("cluster {} exited with error: {}", name, e);
                 }
             }
             _ => {
-                if let Err(e) = proxy::standalone::run(cc).await {
+                if let Err(e) = proxy::standalone::run(cc.clone()).await {
                     tracing::error!("cluster {} exited with error: {}", name, e);
                 }
             }

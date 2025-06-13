@@ -6,7 +6,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::metrics::*;
 
 use crate::com::AsError;
-use crate::protocol::{CmdFlags, CmdType, IntoReply};
+use crate::protocol::{CmdFlags, CmdType};
 use crate::proxy::standalone::Request;
 use crate::utils::trim_hash_tag;
 
@@ -18,6 +18,19 @@ pub use self::msg::Message;
 use std::time::Instant;
 
 const MAX_CYCLE: u8 = 1;
+
+#[derive(Clone, Debug)]
+pub struct Tracker {
+    pub start: Instant,
+}
+
+impl Tracker {
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Cmd {
@@ -88,17 +101,16 @@ impl Request for Cmd {
         true
     }
 
-    fn set_reply<R: IntoReply<Message>>(&self, t: R) {
-        let reply = t.into_reply();
+    fn set_reply(&mut self, reply: Message) {
         self.cmd.lock().unwrap().set_reply(reply);
     }
 
-    fn set_error(&self, t: &AsError) {
-        let reply: Message = t.into_reply();
+    fn set_error(&mut self, err: AsError) {
+        let reply = Message::from(err);
         self.cmd.lock().unwrap().set_error(reply);
     }
 
-    fn set_reply_sender(&self, sender: Self::ReplySender) {
+    fn set_reply_sender(&mut self, sender: Self::ReplySender) {
         self.cmd.lock().unwrap().reply_tx = Some(sender);
     }
 
@@ -116,7 +128,7 @@ impl Request for Cmd {
         let mut c = self.cmd.lock().unwrap();
         match c.remote_tracker.take() {
             Some(t) => {
-                let s = t.start.clone();
+                let s = t.start;
                 c.remote_tracker = Some(t);
                 Some(s)
             }
@@ -245,8 +257,8 @@ impl Decoder for FrontCodec {
         match Message::parse(src).map(|x| x.map(Into::into)) {
             Ok(val) => Ok(val),
             Err(AsError::BadMessage) => {
-                let cmd: Cmd = Message::raw_inline_reply().into();
-                cmd.set_error(&AsError::BadMessage);
+                let mut cmd: Cmd = Message::raw_inline_reply().into();
+                cmd.set_error(AsError::BadMessage);
                 Ok(Some(cmd))
             }
             Err(err) => Err(err),
@@ -254,20 +266,11 @@ impl Decoder for FrontCodec {
     }
 }
 
-impl Encoder<Cmd> for FrontCodec {
+impl Encoder<Message> for FrontCodec {
     type Error = AsError;
 
-    fn encode(&mut self, item: Cmd, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut cmd = item.cmd.lock().unwrap();
-        if let Some(subs) = cmd.subs.as_ref().cloned() {
-            for sub in subs {
-                self.encode(sub, dst)?;
-            }
-            cmd.req.try_save_ends(dst);
-        } else {
-            let reply = cmd.reply.take().expect("reply must exits");
-            cmd.req.save_reply(reply, dst)?;
-        }
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.extend_from_slice(item.data());
         Ok(())
     }
 }

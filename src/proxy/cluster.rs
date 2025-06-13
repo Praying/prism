@@ -1,669 +1,334 @@
 pub mod back;
 pub mod fetcher;
 pub mod front;
-pub mod init;
 pub mod redirect;
+pub use redirect::{Redirect, Redirection};
 
-use crate::com::create_reuse_port_listener;
-use crate::com::{gethostbyname, AsError};
-use crate::com::{ClusterConfig, CODE_PORT_IN_USE};
-use crate::protocol::redis::{Cmd, Message, BackCodec};
-use crate::proxy::standalone::Request;
-// use crate::protocol::redis::{Cmd, RedisHandleCodec, RedisNodeCodec, SLOTS_COUNT};
-const SLOTS_COUNT: usize = 16384;
-use crate::proxy::cluster::fetcher::SingleFlightTrigger;
-use crate::utils::crc::crc16;
+use crate::com::{AsError, ClusterConfig};
+use crate::protocol::redis::{
+    cmd::{Cmd},
+    resp::{self, ClusterLayout},
+};
+use crate::proxy::standalone::{fnv, Request};
+use crate::utils::thread::spawn;
+use bytes::BytesMut;
+use fetcher::Fetch;
+use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt, TryFutureExt};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
 
-use crate::metrics::front_conn_incr;
-
-pub type ReplicaLayout = (Vec<String>, Vec<Vec<String>>);
-
-// use failure::Error;
-use futures::{future::{self}, FutureExt, SinkExt, StreamExt};
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{interval, timeout, Duration};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::codec::Framed;
-
-use tokio::net::TcpStream;
-use tracing::info;
-
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
-use std::process;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
-
-const MAX_NODE_PIPELINE_SIZE: usize = 16 * 1024; // 16k
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Redirect {
-    Move { slot: usize, to: String },
-    Ask { slot: usize, to: String },
+// Define a command channel for removing dead connections
+enum ClusterCmd {
+    Remove(String),
 }
-
-impl Redirect {
-    pub(crate) fn is_ask(&self) -> bool {
-        match self {
-            Redirect::Ask { .. } => true,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Redirection {
-    pub target: Redirect,
-    pub cmd: Cmd,
-}
-
-impl Redirection {
-    pub(crate) fn new(is_move: bool, slot: usize, to: String, cmd: Cmd) -> Redirection {
-        if is_move {
-            Redirection {
-                target: Redirect::Move { slot, to },
-                cmd,
-            }
-        } else {
-            Redirection {
-                target: Redirect::Ask { slot, to },
-                cmd,
-            }
-        }
-    }
-}
-
-pub use Redirect::{Ask, Move};
-
-pub struct RedirectFuture {}
 
 pub struct Cluster {
-    pub cc: Mutex<ClusterConfig>,
-
-    slots: Mutex<Slots>,
-    conns: Mutex<Conns>,
-    hash_tag: Vec<u8>,
-    read_from_slave: bool,
-
-    moved: Sender<Redirection>,
-    fetch: Mutex<Option<Arc<SingleFlightTrigger>>>,
-    latest: Mutex<Instant>,
-}
-
-pub type MovedRecv = Receiver<Redirection>;
-
-impl Cluster {
-    async fn setup_fetch_trigger(self: &Arc<Self>) {
-        let interval_millis = self.cc.lock().unwrap().fetch_interval_ms();
-        let mut interval = interval(Duration::from_millis(interval_millis));
-        interval.tick().await; // consume the first tick
-
-        let (tx, rx) = fetcher::trigger_channel();
-        let trigger = Arc::new(SingleFlightTrigger::new(1, tx.clone()));
-        let _ = self.fetch.lock().unwrap().replace(trigger);
-
-        let mut fetcher = fetcher::Fetch::new(self.clone());
-        tokio::spawn(async move {
-            fetcher.run(rx).await;
-        });
-
-        let interval_tx = tx;
-        tokio::spawn(async move {
-            let mut interval_timer = interval;
-            loop {
-                interval_timer.tick().await;
-                if let Err(err) = interval_tx.send(fetcher::TriggerBy::Interval).await {
-                    tracing::error!("failed to send interval trigger, fetcher may be stopped: {}", err);
-                    break;
-                }
-            }
-        });
-    }
-
-    async fn handle_front_conn(self: &Arc<Self>, sock: TcpStream) {
-        let cluster_name = self.cc.lock().unwrap().name.clone();
-        sock.set_nodelay(true).unwrap_or_else(|err| {
-            tracing::warn!(
-                "cluster {} fail to set nodelay but skip, due to {:?}",
-                cluster_name, err
-            );
-        });
-
-        let client_str = match sock.peer_addr() {
-            Ok(client) => client.to_string(),
-            Err(err) => {
-                tracing::error!(
-                    "cluster {} fail to get client name err {:?}",
-                    cluster_name, err
-                );
-                "unknown".to_string()
-            }
-        };
-
-        front_conn_incr(&cluster_name);
-        // let codec = RedisHandleCodec {};
-        // let (output, input) = codec.framed(sock).split();
-        // let front = front::Front::new(client_str, self.clone(), input, output);
-        // tokio::spawn(front.run());
-        unimplemented!();
-    }
+    pub cc: Arc<Mutex<ClusterConfig>>,
+    pub slots: Arc<Mutex<Vec<String>>>,
+    pub conns: Arc<Mutex<HashMap<String, mpsc::Sender<Cmd>>>>,
+    trigger_tx: mpsc::Sender<fetcher::TriggerBy>,
+    cmd_tx: mpsc::Sender<ClusterCmd>,
 }
 
 impl Cluster {
-    async fn _run(self: Arc<Self>, moved_rx: MovedRecv) -> Result<(), AsError> {
-        let mut redirect_handler = redirect::RedirectHandler::new(self.clone(), moved_rx);
-        tokio::spawn(async move { redirect_handler.run().await });
+    pub fn new(
+        cc: ClusterConfig,
+        trigger_tx: mpsc::Sender<fetcher::TriggerBy>,
+        cmd_tx: mpsc::Sender<ClusterCmd>,
+    ) -> Self {
+        let mut slots = Vec::with_capacity(16384);
+        for _ in 0..16384 {
+            slots.push(String::new());
+        }
 
-        self.setup_fetch_trigger().await;
-        
-        let addr = self.cc.lock().unwrap().listen_addr.parse::<SocketAddr>()
-            .expect("parse socket never fail");
-
-        let listen = match create_reuse_port_listener(&addr) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("listen {} error: {}", addr, e);
-                process::exit(CODE_PORT_IN_USE);
-            }
-        };
-        let listener = tokio::net::TcpListener::from_std(listen)?;
-
-        loop {
-            match listener.accept().await {
-                Ok((sock, _)) => {
-                    let cluster = self.clone();
-                    tokio::spawn(async move {
-                        cluster.handle_front_conn(sock).await;
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("fail to accept incoming sock due to {}", e);
-                }
-            }
+        Self {
+            cc: Arc::new(Mutex::new(cc)),
+            slots: Arc::new(Mutex::new(slots)),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            trigger_tx,
+            cmd_tx,
         }
     }
-}
 
-pub async fn run(cc: ClusterConfig) -> Result<(), AsError> {
-    let mut initializer = init::Initializer::new(cc);
-    initializer.run().await
-}
+    async fn request_one(&self, addr: &str) -> Result<resp::Message, AsError> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
 
-impl Cluster {
-    fn get_addr(&self, slot: usize, is_read: bool) -> String {
-        // trace!("get slot={} and is_read={}", slot, is_read);
-        if self.read_from_slave && is_read {
-            if let Some(replica) = self.slots.lock().unwrap().get_replica(slot) {
-                if replica != "" {
-                    return replica.to_string();
-                }
+        let password = self.cc.lock().unwrap().redis_auth.clone();
+        if let Some(password) = password {
+            let auth_cmd = resp::Message::auth(&password);
+            stream.write_all(&auth_cmd.data).await?;
+            let mut buf = BytesMut::with_capacity(128);
+            let _ = stream.read_buf(&mut buf).await?;
+            let resp = resp::Message::parse(&mut buf)?.ok_or(AsError::BadMessage)?;
+            if resp.is_error() {
+                return Err(AsError::BadAuth);
             }
         }
-        self.slots
-            .lock()
-            .unwrap()
-            .get_master(slot)
-            .map(|x| x.to_string())
-            .expect("master addr never be empty")
+
+        let cmd = resp::Message::new_cluster_nodes();
+        stream.write_all(&cmd.data).await?;
+
+        let mut buf = BytesMut::with_capacity(8192);
+        let _ = stream.read_buf(&mut buf).await?;
+
+        let resp = resp::Message::parse(&mut buf)?.ok_or(AsError::BadMessage)?;
+        Ok(resp)
+    }
+
+    pub fn update_slot(&self, slot: usize, to: String) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        if slots[slot] != to {
+            slots[slot] = to;
+            return true;
+        }
+        false
     }
 
     pub fn trigger_fetch(&self, trigger_by: fetcher::TriggerBy) {
-        if let Some(trigger) = self.fetch.lock().unwrap().clone() {
-            let if_triggered = match trigger_by {
-                fetcher::TriggerBy::Moved => {
-                    trigger.try_trigger();
-                    true
-                }
-                _ => trigger.try_trigger(),
-            };
-
-            if if_triggered {
-                info!("succeed trigger fetch process by {:?}", trigger_by);
-                return;
-            }
-        } else {
-            tracing::warn!("fail to trigger fetch process due to trigger event uninitialed");
+        if let Err(err) = self.trigger_tx.clone().try_send(trigger_by) {
+            error!("fail to trigger fetch due to {}", err);
         }
     }
 
-    pub async fn dispatch_to(&self, addr: &str, cmd: Cmd) -> Result<(), AsError> {
-        if !cmd.can_cycle() {
-            cmd.set_error(&AsError::ClusterFailDispatch);
-            return Ok(());
-        }
+    pub async fn dispatch(&self, cmd: Cmd) -> Result<(), AsError> {
+        let mut redirection = Redirection::new(cmd);
+        let mut retries = 0;
 
-        for i in 0..2 {
-            let sender = {
-                let conns = self.conns.lock().unwrap();
-                conns.get(addr).map(|x| x.sender())
-            };
-
-            if let Some(sender) = sender {
-                if sender.send(Ok(cmd.clone())).await.is_ok() {
-                    return Ok(());
-                }
-            }
-
-            if i == 0 {
-                tracing::warn!("fail to send to backend, maybe connect is broken {}, try to reconnect", addr);
-                let sender = self.connect(addr).await?;
-                let mut conns = self.conns.lock().unwrap();
-                conns.insert(addr, sender);
-            }
-        }
-
-        Err(AsError::BackendClosedError(addr.to_string()))
-    }
-
-    async fn inner_dispatch_all(&self, cmds: &mut VecDeque<Cmd>) -> Result<usize, AsError> {
-        let mut count = 0usize;
         loop {
-            if cmds.is_empty() {
-                return Ok(count);
+            if retries >= MAX_RETRIES {
+                let err = AsError::RequestReachMaxCycle;
+                return redirection.return_err(err).await;
             }
-            let cmd = cmds.pop_front().expect("cmds pop front never be empty");
-            if !cmd.can_cycle() {
-                cmd.set_error(&AsError::ProxyFail);
+            retries += 1;
+
+            let (addr, ask) =
+                if let Some((addr, ask)) = redirection.take_redirect_addr() {
+                    (addr, ask)
+                } else {
+                    let cmd_for_hash = redirection.get_cmd();
+                    let key = crate::proxy::standalone::Request::key_hash(
+                        &cmd_for_hash, // use the clone
+                        self.cc
+                            .lock()
+                            .unwrap()
+                            .hash_tag
+                            .as_ref()
+                            .unwrap()
+                            .as_bytes(),
+                        crate::utils::crc::crc16,
+                    );
+                    let slot = key as usize & (16384 - 1);
+                    (self.slots.lock().unwrap()[slot].clone(), false)
+                };
+            
+            let mut cmd_to_send = redirection.get_cmd();
+
+            if ask {
+                let mut asking_cmd = Cmd::new_asking();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                asking_cmd.set_reply_sender(tx);
+
+                self.dispatch_to(&addr, asking_cmd).await?;
+                let _ = rx.await;
+            }
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cmd_to_send.set_reply_sender(tx);
+            
+            if let Err(err) = self.dispatch_to(&addr, cmd_to_send).await {
+                 return redirection.return_err(err).await;
+            }
+
+            match rx.await {
+                Ok(resp) => {
+                    if resp.is_error() {
+                        let rstr = String::from_utf8_lossy(&resp.data);
+                        if let Some(redirect) = Redirect::parse_from(&rstr) {
+                             self.trigger_fetch(fetcher::TriggerBy::Moved);
+                             redirection.set_redirect(redirect);
+                             continue;
+                        }
+                    }
+                    return redirection.return_ok(resp).await;
+                }
+                Err(_e) => {
+                     return redirection.return_err(AsError::Canceled).await;
+                }
+            }
+        }
+    }
+
+    pub async fn dispatch_to(&self, to: &str, cmd: Cmd) -> Result<(), AsError> {
+        let sender = {
+            let conns = self.conns.lock().unwrap();
+            conns.get(to).cloned()
+        };
+
+        if let Some(mut tx) = sender {
+            return tx.send(cmd).map_err(|_e| AsError::Canceled).await;
+        }
+        
+        warn!("connection to {} not found, maybe need to fetch", to);
+        self.trigger_fetch(fetcher::TriggerBy::Connect(to.to_string()));
+        Err(AsError::TryAgain)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        !self.slots.lock().unwrap().iter().all(String::is_empty)
+    }
+
+    pub fn try_update_all_slots(&self, layout: ClusterLayout) -> bool {
+        let mut new_masters = HashSet::new();
+        let mut changed = false;
+        let mut new_conns = Vec::new();
+
+        for replica in &layout.replicas {
+            let addr = String::from_utf8_lossy(&replica.master).to_string();
+            new_masters.insert(addr.clone());
+
+            let should_add = { !self.conns.lock().unwrap().contains_key(&addr) };
+
+            if should_add {
+                let (tx, rx) = mpsc::channel(1024);
+                let cc = self.cc.lock().unwrap().clone();
+                let addr_for_task = addr.clone();
+                let mut cmd_tx_clone = self.cmd_tx.clone();
+                let fut = async move {
+                    if let Err(err) = back::run(Arc::new(cc), addr_for_task.clone(), rx).await {
+                        warn!(
+                            "fail to run back task for master {} by {}",
+                            addr_for_task,
+                            err.to_string()
+                        );
+                    }
+                    // When back task exits, send a command to remove it from the pool.
+                    if let Err(e) = cmd_tx_clone.send(ClusterCmd::Remove(addr_for_task)).await {
+                        error!("failed to send remove command for dead connection: {}", e);
+                    }
+                };
+                spawn(fut);
+                new_conns.push((addr, tx));
+                changed = true;
+            }
+        }
+
+        let mut conns = self.conns.lock().unwrap();
+        for (addr, tx) in new_conns {
+            conns.insert(addr, tx);
+        }
+
+        conns.retain(|addr, _| new_masters.contains(addr));
+
+        let mut slots = self.slots.lock().unwrap();
+        for i in 0..layout.slots.len() {
+            let replica_index = layout.slots[i] as usize;
+            if replica_index >= layout.replicas.len() {
+                error!("replica index out of bound");
                 continue;
             }
-            let slot = {
-                let hash_tag = self.hash_tag.as_ref();
-                let signed = cmd.key_hash(hash_tag, crc16);
-                if signed == std::u64::MAX {
-                    cmd.set_error(&AsError::BadRequest);
-                    continue;
-                }
-
-                (signed as usize) % SLOTS_COUNT
-            };
-
-            let addr = self.get_addr(slot, cmd.ctype().is_read());
-            let mut conns = self.conns.lock().unwrap();
-
-            if let Some(sender) = conns.get_mut(&addr).map(|x| x.sender()) {
-                match sender.try_send(Ok(cmd)) {
-                    Ok(_) => {
-                        // trace!("success start command into backend");
-                        count += 1;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(cmd))) => {
-                        cmd.add_cycle();
-                        cmds.push_front(cmd);
-                        return Ok(count);
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(cmd))) => {
-                        cmd.add_cycle();
-                        cmds.push_front(cmd);
-                        let sender = self.connect(&addr).await?;
-                        conns.insert(addr.as_str(), sender);
-                        return Ok(count);
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                cmds.push_front(cmd);
-                let sender = self.connect(&addr).await?;
-                conns.insert(addr.as_str(), sender);
-                return Ok(count);
-            }
-        }
-    }
-
-    pub async fn dispatch_all(&self, cmds: &mut VecDeque<Cmd>) -> Result<usize, AsError> {
-        let count = self.inner_dispatch_all(cmds).await?;
-        if count != 0 {
-            *self.latest.lock().unwrap() = Instant::now();
-        }
-        Ok(count)
-    }
-
-    #[allow(unused)]
-    pub(crate) fn since_latest(&self) -> Duration {
-        self.latest.lock().unwrap().elapsed()
-    }
-
-    pub(crate) fn try_update_all_slots(&self, layout: ReplicaLayout) -> bool {
-        let (masters, replicas) = layout;
-        let updated = self
-            .slots
-            .lock()
-            .unwrap()
-            .try_update_all(masters.clone(), replicas);
-        if updated {
-            let handle = &mut self.cc.lock().unwrap();
-            handle.servers.clear();
-            handle.servers.extend_from_slice(&masters);
-        }
-        updated
-    }
-
-    pub(crate) fn update_slot(&self, slot: usize, addr: String) -> bool {
-        debug_assert!(slot <= SLOTS_COUNT);
-        self.slots.lock().unwrap().update_slot(slot, addr)
-    }
-
-    pub(crate) async fn connect(&self, addr: &str) -> Result<Sender<Result<Cmd, ()>>, AsError> {
-        let is_replica = !self.slots.lock().unwrap().is_master(addr);
-
-        let (cluster_name, read_timeout, write_timeout, fetch) = {
-            let cc = self.cc.lock().unwrap();
-            let fetch = self.fetch.lock().unwrap();
-            (
-                cc.name.clone(),
-                cc.read_timeout.clone(),
-                cc.write_timeout.clone(),
-                fetch.as_ref().map(|x| Arc::downgrade(x)).unwrap_or_default(),
-            )
-        };
-
-        ConnBuilder::new()
-            .moved(self.moved.clone())
-            .cluster(cluster_name)
-            .node(addr.to_string())
-            .read_timeout(read_timeout)
-            .write_timeout(write_timeout)
-            .fetch(fetch)
-            .replica(is_replica)
-            .connect()
-            .await
-    }
-}
-
-pub(crate) struct Conns {
-    inner: HashMap<String, Conn<Sender<Result<Cmd, ()>>>>,
-}
-
-impl Conns {
-    fn get(&self, s: &str) -> Option<&Conn<Sender<Result<Cmd, ()>>>> {
-        self.inner.get(s)
-    }
-
-    fn get_mut(&mut self, s: &str) -> Option<&mut Conn<Sender<Result<Cmd, ()>>>> {
-        self.inner.get_mut(s)
-    }
-
-    fn insert(&mut self, s: &str, sender: Sender<Result<Cmd, ()>>) {
-        let conn = Conn {
-            addr: s.to_string(),
-            sender,
-        };
-        self.inner.insert(s.to_string(), conn);
-    }
-}
-
-impl Default for Conns {
-    fn default() -> Conns {
-        Conns {
-            inner: HashMap::new(),
-        }
-    }
-}
-
-#[allow(unused)]
-struct Conn<S> {
-    addr: String,
-    sender: S,
-}
-
-impl<S> Conn<S> {
-    fn sender(&self) -> S where S: Clone {
-        self.sender.clone()
-    }
-}
-
-struct Slots {
-    masters: Vec<String>,
-    replicas: Vec<Replica>,
-
-    all_masters: HashSet<String>,
-    all_replicas: HashSet<String>,
-}
-
-impl Slots {
-    fn try_update_all(&mut self, masters: Vec<String>, replicas: Vec<Vec<String>>) -> bool {
-        let mut changed = false;
-        for (i, master) in masters.iter().enumerate().take(SLOTS_COUNT) {
-            if &self.masters[i] != master {
-                changed = true;
-                self.masters[i] = master.clone();
-                self.all_masters.insert(master.clone());
-            }
-        }
-
-        for (i, replica) in replicas.iter().enumerate().take(SLOTS_COUNT) {
-            let len_not_eqal = self.replicas[i].addrs.len() != replica.len();
-            if len_not_eqal || self.replicas[i].addrs.as_slice() != replica.as_slice() {
-                self.replicas[i] = Replica {
-                    addrs: replica.clone(),
-                    current: Cell::new(0),
-                };
-                self.all_replicas.extend(replica.clone().into_iter());
+            let replica = &layout.replicas[replica_index];
+            let addr = String::from_utf8_lossy(&replica.master).to_string();
+            if slots[i] != addr {
+                slots[i] = addr;
                 changed = true;
             }
         }
-
         changed
     }
 
-    fn update_slot(&mut self, slot: usize, addr: String) -> bool {
-        let old = self.masters[slot].clone();
-        self.masters[slot] = addr.clone();
-        self.all_masters.insert(addr.clone());
-        old != addr
-    }
-
-    fn get_master(&self, slot: usize) -> Option<&str> {
-        self.masters.get(slot).map(|x| x.as_str())
-    }
-
-    fn get_replica(&self, slot: usize) -> Option<&str> {
-        self.replicas.get(slot).map(|x| x.get_replica())
-    }
-
-    pub fn get_all_masters(&self) -> Vec<String> {
-        self.all_masters.iter().cloned().collect()
-    }
-
-    pub fn get_all_replicas(&self) -> Vec<String> {
-        self.all_replicas.iter().cloned().collect()
-    }
-
-    pub(crate) fn is_master(&self, addr: &str) -> bool {
-        self.all_masters.contains(addr)
-    }
-}
-
-impl Default for Slots {
-    fn default() -> Slots {
-        Slots {
-            masters: vec!["".to_string(); SLOTS_COUNT],
-            replicas: vec![Replica::default(); SLOTS_COUNT],
-            all_masters: HashSet::new(),
-            all_replicas: HashSet::new(),
+    fn remove_conn(&self, addr: &str) {
+        if self.conns.lock().unwrap().remove(addr).is_some() {
+            info!("Removed dead connection for {}", addr);
         }
     }
 }
 
-#[derive(Clone, Debug)]
-struct Replica {
-    addrs: Vec<String>,
-    current: Cell<usize>,
-}
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRIES: usize = 5;
 
-impl Replica {
-    fn get_replica(&self) -> &str {
-        if self.addrs.is_empty() {
-            return "";
-        }
-        let current = self.current.get();
-        let next = (current + 1) % self.addrs.len();
-        self.current.set(next);
-        self.addrs[current].as_str()
-    }
-}
+pub async fn run(cc: ClusterConfig) -> Result<(), AsError> {
+    let listen_addr = cc.listen_addr.clone();
 
-impl Default for Replica {
-    fn default() -> Replica {
-        Replica {
-            addrs: vec![],
-            current: Cell::new(0),
-        }
-    }
-}
+    let (trigger_tx, trigger_rx) = fetcher::trigger_channel();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+    let cluster = Arc::new(Cluster::new(cc, trigger_tx, cmd_tx));
 
-fn silence_send_req(cmd: Cmd, tx: &mut Sender<Result<Cmd, ()>>) {
-    match tx.try_send(Ok(cmd)) {
-        Ok(_) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(Ok(cmd))) => {
-            let _ = cmd.get_reply().map(|e| {
-                tracing::error!("fail to send cmd for broken channel {:?}", e);
-            });
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(cmd))) => {
-            let _ = cmd.get_reply().map(|e| {
-                tracing::error!("fail to send cmd for full channel {:?}", e);
-            });
-        }
-        _ => unreachable!(),
-    }
-}
+    let mut fetcher = Fetch::new(cluster.clone());
 
-
-pub(crate) struct ConnBuilder {
-    cluster: Option<String>,
-    node: Option<String>,
-    read_timeout: Option<u64>,
-    write_timeout: Option<u64>,
-    moved: Option<Sender<Redirection>>,
-    fetch: Option<Weak<SingleFlightTrigger>>,
-    is_replica: bool,
-}
-
-impl ConnBuilder {
-    pub(crate) fn new() -> ConnBuilder {
-        ConnBuilder {
-            cluster: None,
-            node: None,
-            read_timeout: None,
-            write_timeout: None,
-            moved: None,
-            fetch: None,
-            is_replica: false,
-        }
-    }
-
-    pub(crate) fn fetch(mut self, fetch: Weak<SingleFlightTrigger>) -> Self {
-        self.fetch = Some(fetch);
-        self
-    }
-
-    pub(crate) fn cluster(mut self, cluster: String) -> Self {
-        self.cluster = Some(cluster);
-        self
-    }
-
-    pub(crate) fn moved(mut self, moved: Sender<Redirection>) -> Self {
-        self.moved = Some(moved);
-        self
-    }
-
-    pub(crate) fn read_timeout(mut self, rt: Option<u64>) -> Self {
-        self.read_timeout = rt;
-        self
-    }
-
-
-
-    pub(crate) fn write_timeout(mut self, wt: Option<u64>) -> Self {
-        self.write_timeout = wt;
-        self
-    }
-
-    pub(crate) fn node(mut self, node: String) -> Self {
-        self.node = Some(node);
-        self
-    }
-
-    pub(crate) fn replica(mut self, is_replica: bool) -> Self {
-        self.is_replica = is_replica;
-        self
-    }
-
-    // connect to one backend
-    pub(crate) async fn connect(self) -> Result<Sender<Result<Cmd, ()>>, AsError> {
-        let node_addr = self.node.expect("node must be some");
-        let cluster = self.cluster.expect("cluster must be some");
-        let moved = self.moved.expect("moved must be some");
-        let rt = self.read_timeout;
-        let wt = self.write_timeout;
-        let is_replica = self.is_replica;
-
-        let addr = gethostbyname(&node_addr).map_err(|e| AsError::BadHost(e.to_string()))?;
-
-        let fut = TcpStream::connect(addr);
-        let stream = match timeout(Duration::from_millis(100), fut).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                tracing::error!(
-                    "fail to connect to {} by given name {} reason {}",
-                    addr, node_addr, err
-                );
-                return Err(AsError::IoError(err));
+    let mut retries = 0;
+    while retries < MAX_RETRIES {
+        let update_result = async {
+            let addrs = cluster.cc.lock().unwrap().servers.clone();
+            if addrs.is_empty() {
+                return Err(AsError::BadConfig("missing node address".to_string()));
             }
-            Err(err) => {
-                tracing::error!(
-                    "fail to connect to {} by given name {} reason {}",
-                    addr, node_addr, err
-                );
-                return Err(AsError::IoError(tokio::io::Error::new(
-                    tokio::io::ErrorKind::TimedOut,
-                    err,
-                )));
+            let resp = cluster.request_one(&addrs[0]).await?;
+            fetcher.update_from_message(&resp)
+        }
+        .await;
+
+        let is_ready = cluster.is_ready();
+
+        if let Err(e) = &update_result {
+            error!("failed to update cluster info: {}", e);
+        }
+
+        if update_result.is_ok() && is_ready {
+            info!("Cluster is ready to serve.");
+            break;
+        }
+
+        retries += 1;
+        if retries >= MAX_RETRIES {
+            return Err(AsError::BadConfig(
+                "failed to initialize cluster after several retries".to_string(),
+            ));
+        }
+
+        info!(
+            "failed to fetch cluster info, will retry in {} seconds. (attempt {}/{})",
+            RETRY_DELAY.as_secs(),
+            retries,
+            MAX_RETRIES
+        );
+        sleep(RETRY_DELAY).await;
+    }
+
+    // Main command processing loop
+    let cluster_clone_for_cmd = cluster.clone();
+    spawn(async move {
+        while let Some(cmd) = cmd_rx.next().await {
+            match cmd {
+                ClusterCmd::Remove(addr) => {
+                    cluster_clone_for_cmd.remove_conn(&addr);
+                }
+            }
+        }
+    });
+
+    spawn(async move {
+        fetcher.run(trigger_rx).await;
+        info!("fetcher stopped");
+    });
+
+    let listen = TcpListener::bind(&listen_addr).await?;
+    info!("start listening on {}", listen_addr);
+    loop {
+        let (stream, addr) = listen.accept().await?;
+        info!("accept a new connection from {}", addr);
+
+        let cluster_clone = cluster.clone();
+        let fut = async move {
+            if let Err(err) = front::run(stream, cluster_clone).await {
+                error!("front codec failed with err {}", err);
             }
         };
 
-        let codec = BackCodec::default();
-        let (back_tx, back_rx) = Framed::new(stream, codec).split();
-
-        let (tx, rx) = mpsc::channel(MAX_NODE_PIPELINE_SIZE);
-        let input = ReceiverStream::new(rx);
-        let output = back_tx.sink_map_err(AsError::from);
-        let recv = back_rx.filter_map(|x| future::ready(x.ok()));
-        
-        if is_replica {
-            let cmd = Cmd::from(Message::new_read_only());
-            silence_send_req(cmd, &mut tx.clone());
-        }
-
-        let backend = back::run(
-            cluster,
-            node_addr.clone(),
-            input,
-            output,
-            recv,
-            moved,
-            rt.unwrap_or(1000),
-        );
-        tokio::spawn(backend);
-
-        let ping_cmd = Cmd::ping_request();
-        if let Err(err) = tx.send(Ok(ping_cmd.clone())).await {
-            tracing::error!("fail to send cmd to backend {}", err);
-            tracing::warn!(
-                "fail to init connection of replica due to {:?}",
-                ping_cmd.get_reply()
-            );
-            return Err(AsError::ConnectFail(addr.to_string()));
-        }
-
-        if is_replica {
-            let cmd = Cmd::from(Message::new_read_only());
-            if let Err(err) = tx.send(Ok(cmd.clone())).await {
-                let _ = cmd.get_reply().map(|e| tracing::error!("fail to send read only cmd {:?}", e));
-                return Err(AsError::ConnectFail(addr.to_string()));
-            }
-        }
-        Ok(tx)
+        spawn(fut);
     }
 }

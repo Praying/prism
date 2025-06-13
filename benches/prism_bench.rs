@@ -1,10 +1,7 @@
-#[macro_use]
-extern crate criterion;
-
+use criterion::{criterion_group, criterion_main, Criterion};
 use libprism::protocol::redis::resp::MessageMut;
 
 use bytes::BytesMut;
-use criterion::Criterion;
 
 fn bench_resp(c: &mut Criterion) {
     c.bench_function("resp parse plain", |b| {
