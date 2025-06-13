@@ -157,7 +157,7 @@ impl Version {
     }
 }
 
-pub struct Reloader<T> {
+pub struct Reloader<T: Request> {
     name: String,
     cluster: Weak<Cluster<T>>,
     current: Version,
@@ -168,7 +168,7 @@ pub struct Reloader<T> {
 impl<T: Request + 'static> Reloader<T> {
     pub fn new(cluster: Rc<Cluster<T>>) -> Self {
         let enable = enable_reload();
-        let name = cluster.cc.lock().unwrap().name.clone();
+        let name = cluster.cc.name.clone();
         let weak = Rc::downgrade(&cluster);
         Reloader {
             name,
@@ -183,7 +183,7 @@ impl<T: Request + 'static> Reloader<T> {
     }
 }
 
-impl<T> Future for Reloader<T>
+impl<T: Request> Future for Reloader<T>
 where
     T: Request + Unpin + 'static,
 {
@@ -223,7 +223,7 @@ where
                 }
             };
 
-            let cc = match config.cluster(&self.name) {
+            let _cc = match config.get_cluster(&self.name) {
                 Some(cc) => cc,
                 None => {
                     debug!("fail to reload, config absents cluster {}", self.name);
@@ -236,7 +236,7 @@ where
                 //     error!("fail to reload due to {:?}", err);
                 //     continue;
                 // }
-                info!("success reload for cluster {}", cluster.cc.lock().unwrap().name);
+                info!("success reload for cluster {}", self.name);
                 self.current = current;
             } else {
                 tracing::error!("fail to reload due to cluster has been destroyed");

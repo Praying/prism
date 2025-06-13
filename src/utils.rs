@@ -1,8 +1,10 @@
 use bytes::BytesMut;
+use std::ops;
 
 pub mod crc;
 pub mod notify;
 pub mod simdfind;
+pub mod thread;
 
 const LOWER_BEGIN: u8 = b'a';
 const LOWER_END: u8 = b'z';
@@ -89,8 +91,13 @@ impl Range {
     }
 
     #[inline]
-    pub fn range(self) -> usize {
+    pub fn len(self) -> usize {
         (self.end - self.begin) as usize
+    }
+
+    #[inline]
+    pub fn as_range(self) -> ops::Range<usize> {
+        self.begin as usize..self.end as usize
     }
 }
 

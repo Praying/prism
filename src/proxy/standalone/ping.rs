@@ -1,10 +1,12 @@
 use tokio::time::{self, Interval};
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::proxy::standalone::{Cluster, Request};
+use crate::protocol::IntoReply;
+use crate::proxy::standalone::{PingCmd, Request};
+use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 #[derive(Debug)]
@@ -17,8 +19,8 @@ enum State<T> {
 }
 
 pub struct Ping<T: Request> {
-    cluster: Weak<Cluster<T>>,
-
+    ping_tx: mpsc::Sender<PingCmd>,
+    conn_tx: mpsc::Sender<T>,
     name: String,
     addr: String,
 
@@ -32,15 +34,14 @@ pub struct Ping<T: Request> {
     cancel: Arc<AtomicBool>,
 }
 
-impl<T: Request + Send + 'static> Ping<T> {
+impl<T: Request + Send + 'static + From<crate::protocol::redis::cmd::Cmd>> Ping<T>
+where
+    T::Reply: IntoReply<crate::protocol::redis::resp::Message>,
+{
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cluster: Weak<Cluster<T>>,
-        name: String,
-        addr: String,
-        cancel: Arc<AtomicBool>,
-        interval_millis: u64,
-        succ_interval_millis: u64,
-        limit: u8,
+        ping_tx: mpsc::Sender<PingCmd>, conn_tx: mpsc::Sender<T>, name: String, addr: String,
+        cancel: Arc<AtomicBool>, interval_millis: u64, succ_interval_millis: u64, limit: u8,
     ) -> Ping<T> {
         let fail_interval = time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -52,7 +53,8 @@ impl<T: Request + Send + 'static> Ping<T> {
         );
 
         Ping {
-            cluster,
+            ping_tx,
+            conn_tx,
             name,
             addr,
             fail_interval,
@@ -67,10 +69,7 @@ impl<T: Request + Send + 'static> Ping<T> {
     pub async fn run(mut self) {
         loop {
             if self.cancel.load(Ordering::SeqCst) {
-                info!(
-                    "ping to {}({}) was canceld by handle",
-                    self.name, self.addr
-                );
+                info!("ping to {}({}) was canceld by handle", self.name, self.addr);
                 return;
             }
 
@@ -79,18 +78,14 @@ impl<T: Request + Send + 'static> Ping<T> {
                 State::Justice(is_last_succ) => {
                     if is_last_succ {
                         if self.count > self.limit {
-                            // removed but success next time
-                            let cluster = self.cluster.upgrade();
-                            if let Some(cluster) = cluster {
-                                let name = self.name.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = cluster.add_node(name.clone()).await {
-                                        tracing::error!("fail to add node for {} due to {:?}", name, err);
-                                    }
-                                });
-                            } else {
-                                return;
-                            }
+                            info!(
+                                "node={} addr={} recover from ping error",
+                                self.name, self.addr
+                            );
+                            let _ = self
+                                .ping_tx
+                                .send(PingCmd::Reconnect(self.addr.clone()))
+                                .await;
                         }
                         self.count = 0;
                         self.state = State::OnSuccess;
@@ -100,27 +95,17 @@ impl<T: Request + Send + 'static> Ping<T> {
 
                         #[allow(clippy::comparison_chain)]
                         if self.count == self.limit {
-                            if let Some(cluster) = self.cluster.upgrade() {
-                                info!("remove node={} addr={} by ping error", self.name, self.addr);
-                                cluster.remove_node(self.name.clone());
-                            } else {
-                                return;
-                            }
+                            info!("remove node={} addr={} by ping error", self.name, self.addr);
+                            // The worker will handle the removal, we just need to try and reconnect.
+                            let _ = self
+                                .ping_tx
+                                .send(PingCmd::Reconnect(self.addr.clone()))
+                                .await;
                             self.state = State::OnFail;
                         } else if self.count > self.limit {
                             self.state = State::OnFail;
                         } else {
                             self.state = State::OnSuccess;
-                        }
-
-                        let cluster = self.cluster.upgrade();
-                        if let Some(cluster) = cluster {
-                            let addr = self.addr.clone();
-                            tokio::spawn(async move {
-                                cluster.reconnect(&addr).await;
-                            });
-                        } else {
-                            return;
                         }
                     }
                 }
@@ -140,39 +125,19 @@ impl<T: Request + Send + 'static> Ping<T> {
                         self.state = State::Justice(false);
                         continue;
                     }
-                    let sender = if let Some(cluster) = self.cluster.upgrade() {
-                        let mut conns = cluster.conns.lock().unwrap();
-                        if let Some(conn) = conns.get_mut(&self.addr) {
-                            Some(conn.sender().clone())
-                        } else {
-                            info!("connection to {} not found for ping", self.addr);
-                            None
-                        }
-                    } else {
-                        info!("cluster has drooped and exit ping");
-                        return;
-                    };
 
-                    if let Some(sender) = sender {
-                        match sender.send(rc_cmd).await {
-                            Ok(_) => {
-                                self.state = State::Waitting(cmd);
-                            }
-                            Err(err) => {
-                                info!("fail to dispatch_to {} due to {:?}", self.addr, err);
-                                self.state = State::Justice(false);
-                            }
+                    match self.conn_tx.send(rc_cmd).await {
+                        Ok(_) => {
+                            self.state = State::Waitting(cmd);
                         }
-                    } else {
-                        self.state = State::Justice(false);
+                        Err(err) => {
+                            info!("fail to dispatch_to {} due to {:?}", self.addr, err);
+                            self.state = State::Justice(false);
+                        }
                     }
                 }
 
                 State::Waitting(ref cmd) => {
-                    // This is a busy loop, which is not ideal.
-                    // A better way would be to use a waker.
-                    // The `Request` trait has `reregister`, which is now removed from the call sites.
-                    // For now, a small sleep is added to prevent pegging the CPU.
                     if !cmd.is_done() {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         self.state = state; // put it back
@@ -184,4 +149,3 @@ impl<T: Request + Send + 'static> Ping<T> {
         }
     }
 }
-

@@ -2,9 +2,13 @@
     name = "test-dns-resolver"
     listen_addr = "0.0.0.0:6379"
     cache_type = "redis"
+    listen_proto = "tcp"
+    thread = 1
     servers=[
-        "localhost:6379",
+        "127.0.0.1:6379",
     ]
+    tcp_keepalive_secs = 0
+    redis_ping_interval_secs = 0
 
 [[clusters]]
     name = "test-mc-standalone"
@@ -15,6 +19,8 @@
     servers = [
         "127.0.0.1:11211:10 mc-1",
     ]
+    tcp_keepalive_secs = 0
+    redis_ping_interval_secs = 0
 
     fetch_interval = 3600000 
     read_from_slave = false
@@ -37,7 +43,10 @@
     servers = [
         "127.0.0.1:6379:10 redis-1",
     ]
-    thread = 1
+    tcp_keepalive_secs = 0
+    redis_ping_interval_secs = 0
+    redis_auth = ""
+    thread = 0
     fetch_interval = 3600000 
     read_from_slave = false
 
@@ -57,6 +66,8 @@
     thread = 1
     cache_type = "redis_cluster"
     servers = ["127.0.0.1:3300"]
+    tcp_keepalive_secs = 0
+    redis_ping_interval_secs = 0
 
     fetch_interval = 1800000 # 1800s , 30 minutes
     fetch_since_latest_cmd = 1000 # 3600s , 1 hour

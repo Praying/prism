@@ -1,158 +1,170 @@
-// #![deny(warnings)]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
-
-extern crate clap;
-
-#[macro_use]
-extern crate prometheus;
-
-pub mod metrics;
-
-use clap::{App, Arg};
-
-pub const PRISM_VERSION: &str = env!("CARGO_PKG_VERSION");
+#![allow(
+    clippy::missing_safety_doc,
+    clippy::uninit_vec,
+    clippy::upper_case_acronyms
+)]
 
 pub mod com;
+pub mod metrics;
 pub mod protocol;
 pub mod proxy;
-pub(crate) mod utils;
+pub mod utils;
 
-use anyhow::Result;
-use tokio::signal;
+use crate::com::{AsError, CacheType, Config};
+use clap::{self, App, Arg};
+use futures::future::BoxFuture;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::runtime;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
-use com::meta::{load_meta, meta_init};
-use com::ClusterConfig;
-use tracing::{debug, info};
+pub const PRISM_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub fn run() -> Result<(), ()> {
+    let rt = runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
 
-pub async fn run() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
-    let matches = App::new("prism")
-        .version(PRISM_VERSION)
-        .author("Praying. <codegpt@gmail.com>")
-        .about("Prism is a light, fast and powerful cache proxy written in rust.")
-        .arg(
-            Arg::with_name("config")
-                .value_name("FILE")
-                .help("Sets a custom config file")
-                .takes_value(true)
-                .required(true),
-        )
-        .arg(
+    if let Err(err) = rt.block_on(async {
+        let matches = App::new("prism-proxy")
+            .version(PRISM_VERSION)
+            .author("Praying. <codegpt@gmail.com>")
+            .about("Prism is a light, fast and powerful cache proxy written in rust.")
+            .arg(
+                Arg::with_name("config")
+                    .value_name("FILE")
+                    .help("Sets a custom config file")
+                    .takes_value(true)
+                    .required(true),
+            ).arg(
             Arg::with_name("ip")
-                .short('i')
+                .short("i")
                 .long("ip")
                 .help("expose given ip for CLUSTER SLOTS/NODES command(may be used by jedis cluster connection).")
                 .takes_value(true),
         )
-        .arg(
-            Arg::with_name("metrics")
-                .short('m')
-                .long("metrics")
-                .help("port to expose prometheus (if compile without 'metrics' feature, this flag will be ignore).")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("version")
-                .short('V')
-                .long("version")
-                .help("show the version of prism."),
-        )
-        .arg(
-            Arg::with_name("reload")
-                .short('r')
-                .long("reload")
-                .help("enable reload feature for standalone proxy mode."),
-        )
-        .get_matches();
-    let config = matches.value_of("config").unwrap_or("default.toml");
-    let watch_file = config.to_string();
-    let ip = matches.value_of("ip").map(|x| x.to_string());
-    let enable_reload = matches.is_present("reload");
-    info!("[prism-{}] loading config from {}", PRISM_VERSION, config);
-    let cfg = com::Config::load(&config)?;
-    debug!("use config : {:?}", cfg);
-    assert!(
-        !cfg.clusters.is_empty(),
-        "clusters is absent of config file"
-    );
-    // TODO: make reload async
-    // crate::proxy::standalone::reload::init(&watch_file, cfg.clone(), enable_reload)?;
+            .arg(
+                Arg::with_name("metrics")
+                    .short("m")
+                    .long("metrics")
+                    .help("port to expose prometheus (if compile without 'metrics' feature, this flag will be ignore).")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("version")
+                    .short("V")
+                    .long("version")
+                    .help("show the version of prism."),
+            )
+            .arg(
+                Arg::with_name("reload")
+                    .short("r")
+                    .long("reload")
+                    .help("enable reload feature for standalone proxy mode."),
+            )
+            .get_matches();
 
-    let mut handles = Vec::new();
+        let config_path = matches.value_of("config").expect("config file is needed");
+        let cfg = Config::load(config_path).expect("load config file failed");
 
-    for cluster in cfg.clusters.into_iter() {
-        if cluster.servers.is_empty() {
-            tracing::warn!(
-                "fail to running cluster {} in addr {} due filed `servers` is empty",
-                cluster.name, cluster.listen_addr
-            );
-            continue;
+        let mut handles = Vec::new();
+
+        for cluster_config in cfg.clusters.into_iter() {
+            let name = cluster_config.name.clone();
+            info!("start cluster {} with config {:?}", name, &cluster_config);
+            if cluster_config.servers.is_empty() {
+                warn!("cluster {} with empty servers", name);
+                continue;
+            }
+
+            let workers = cluster_config.thread;
+            let cc = Arc::new(cluster_config);
+
+            let listener = if cc.cache_type != CacheType::RedisCluster {
+                let listener = TcpListener::bind(&cc.listen_addr)
+                    .await
+                    .expect("bind failed");
+                Some(Arc::new(listener))
+            } else {
+                None
+            };
+
+            for i in 0..workers {
+                info!("spawning worker {} for cluster {}", i, name);
+
+                let cc_clone = cc.clone();
+                let name_clone = name.clone();
+                let listener_clone = listener.clone();
+
+                let handle: JoinHandle<()> = tokio::spawn(async move {
+                    if let Some(listener) = listener_clone {
+                        let fut: BoxFuture<'static, ()> = match &cc_clone.cache_type {
+                            CacheType::Redis => {
+                                Box::pin(proxy::standalone::worker_redis_main(cc_clone, listener))
+                            }
+                            CacheType::Memcache => {
+                                Box::pin(proxy::standalone::worker_mc_main(cc_clone, listener))
+                            }
+                            CacheType::MemcacheBinary => {
+                                Box::pin(async { unimplemented!() })
+                            }
+                            CacheType::RedisClusterProxy => {
+                                Box::pin(async { unimplemented!() })
+                            }
+                            CacheType::RedisCluster => {
+                                // This path should not be taken due to the listener check above.
+                                return;
+                            }
+                        };
+                        fut.await;
+                    } else {
+                        // This is the redis_cluster path
+                        let fut = proxy::cluster::run((*cc_clone).clone());
+                        if let Err(e) = fut.await {
+                            tracing::error!(
+                                "cluster {} exited with error: {}",
+                                name_clone,
+                                e
+                            );
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
         }
 
-        if cluster.name.is_empty() {
-            tracing::warn!(
-                "fail to running cluster {} in addr {} due filed `name` is empty",
-                cluster.name, cluster.listen_addr
-            );
-            continue;
+        let mut terminate = signal(SignalKind::terminate()).unwrap();
+        let mut interrupt = signal(SignalKind::interrupt()).unwrap();
+
+        tokio::select! {
+            _ = terminate.recv() => {
+                info!("receive terminate signal");
+            },
+            _ = interrupt.recv() => {
+                info!("receive interrupt signal");
+            },
         }
 
-        info!(
-            "starting prism cluster {} in addr {}",
-            cluster.name, cluster.listen_addr
-        );
+        for handle in &handles {
+            handle.abort();
+        }
 
-        let handle = spawn_cluster(cluster, ip.clone());
-        handles.push(handle);
-    }
+        for handle in handles {
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    error!("worker exited with error: {}", e);
+                }
+            }
+        }
 
-    let port_str = matches.value_of("metrics").unwrap_or("2110");
-    let port = port_str.parse::<usize>().unwrap_or(2110);
-    let metrics_handle = tokio::spawn(async move {
-        // TODO: make metrics::init async
-        // metrics::init(port).await
-    });
-    handles.push(metrics_handle);
-
-    info!("all services started, press ctrl-c to shutdown");
-    signal::ctrl_c().await?;
-    info!("received ctrl-c, shutting down");
-
-    for handle in handles {
-        handle.abort();
+        info!("all clusters are closed");
+        Ok::<(), AsError>(())
+    }) {
+        error!("fail to start servers due to {:?}", err);
+        return Err(());
     }
 
     Ok(())
-}
-
-fn spawn_cluster(cc: ClusterConfig, ip: Option<String>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // The original logic spawns multiple threads (workers).
-        // In the new model, we can spawn multiple async tasks onto the single runtime.
-        // For now, we'll just run one task per cluster for simplicity.
-        // We can revisit this to spawn multiple tasks if needed for performance.
-        let meta = load_meta(cc.clone(), ip);
-        info!("setup meta info with {:?}", meta);
-        meta_init(meta);
-
-        // The tokio::task::Builder is not available in stable tokio 1.x.
-        // We'll just run the cluster logic directly in the spawned task.
-        let name = cc.name.clone();
-        match &cc.cache_type {
-            com::CacheType::RedisCluster => {
-                if let Err(e) = proxy::cluster::run(cc).await {
-                    tracing::error!("cluster {} exited with error: {}", name, e);
-                }
-            }
-            _ => {
-                if let Err(e) = proxy::standalone::run(cc).await {
-                    tracing::error!("cluster {} exited with error: {}", name, e);
-                }
-            }
-        }
-    })
 }
