@@ -47,7 +47,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 pin-project = "1.0"
 actix-web = "4"
-network-interface = "1.1.4"
+network-interface = "2.0.1"
 aho-corasick = "1.0"
 byteorder = "1.4"
 hashbrown = "0.14"
