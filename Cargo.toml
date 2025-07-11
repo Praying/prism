@@ -39,7 +39,7 @@ rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # for metrics
-sysinfo = { version = "0.35", optional = true }
+sysinfo = { version = "0.36", optional = true }
 # for redis protocol
 md5 = "0.8"
 tokio-util = { version = "0.7", features = ["codec"] }
